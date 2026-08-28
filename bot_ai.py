@@ -4,147 +4,158 @@ import logging
 import asyncio
 import json
 import re
-import google.generativeai as genai
+import urllib.request
 
 import config
+from rag import insert_to_rag, query_rag
 
 logger = logging.getLogger(__name__)
-
-model = None
-current_key_index = 0
-API_KEYS = []
-
-def init_ai(api_keys_list):
-    global API_KEYS, current_key_index
-    API_KEYS = api_keys_list
-    current_key_index = 0
-    return initialize_model()
-    
-def initialize_model():
-    global model, current_key_index
-    if not API_KEYS:
-        logger.critical("❌ API_KEYS пуст!")
-        return False
-    current_key = API_KEYS[current_key_index]
-    
-    # Настройки безопасности: отключаем блокировки
-    safety_settings = {
-        'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
-        'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
-        'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
-        'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
-    }
-    
-    genai.configure(api_key=current_key, transport='rest')
-    try:
-        model = genai.GenerativeModel('gemini-flash-latest', safety_settings=safety_settings)
-        logger.info(f"🔑 Успешная инициализация ключа #{current_key_index+1}")
-        return True
-    except Exception:
-        try:
-            model = genai.GenerativeModel('gemini-1.5-flash', safety_settings=safety_settings)
-            logger.info(f"🔑 Успешная инициализация ключа #{current_key_index+1} с gemini-1.5-flash")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Не удалось инициализировать модель: {e}")
-            return False
-
-def rotate_key():
-    global current_key_index
-    current_key_index = (current_key_index + 1) % len(API_KEYS)
-    logger.warning("⚠️ Меняю API ключ...")
-    return initialize_model()
 
 def clean_json_response(text):
     match = re.search(r'\{.*\}', text, re.DOTALL)
     return match.group(0).strip() if match else text.strip()
 
 async def safe_generate_content(prompt, temperature=0.85):
-    """
-    Безопасная обертка для вызова Gemini API.
-    """
-    global model
     logger.info(f"📤 [GEMINI] Отправка промпта длиной: {len(prompt)} символов")
-    config_gen = genai.types.GenerationConfig(temperature=temperature)
-    
-    for _ in range(len(API_KEYS) + 1):
-        if not model:
-            logger.error("❌ Модель не инициализирована.")
-            return None
+    payload = json.dumps({
+        "model": config.GEMINI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{config.GEMINI_PROXY_URL}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.GEMINI_PROXY_KEY}"
+        }
+    )
+
+    for attempt in range(3):
         try:
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, lambda: model.generate_content(prompt, generation_config=config_gen))
-            
-            if not response.candidates:
-                block_reason = "Неизвестно"
-                if response.prompt_feedback:
-                    block_reason = response.prompt_feedback.block_reason.name
-                logger.error(f"❌ [GEMINI] Ответ заблокирован! Причина: {block_reason}")
-                raise ValueError(f"Blocked: {block_reason}")
-                
-            return response
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=180))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"]
+            logger.info(f"📤 [GEMINI] Ответ получен, длина: {len(text)} символов")
+            return text
         except Exception as e:
-            logger.error(f"❌ [GEMINI] Ошибка API с ключом #{current_key_index+1}: {e}", exc_info=False)
-            if not rotate_key():
-                logger.critical("❌ [GEMINI] Все ключи нерабочие.")
-                return None
+            logger.error(f"❌ [GEMINI] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
     return None
 
-async def try_parse_or_repair_json(raw_response_obj):
-    if not raw_response_obj: return None
+async def search_web(query):
+    logger.info(f"🔍 [SEARCH] Поиск: {query}")
+    payload = json.dumps({
+        "model": config.DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": "Ты — поисковый агент. Отвечай КОРОТКО и ТОЛЬКО по заданию. Всегда добавляй ссылки на источники. Не пиши воду, не объясняй контекст — только факт и ссылка."},
+            {"role": "user", "content": query}
+        ],
+        "temperature": 0.3,
+        "search": True
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+        }
+    )
+
+    for attempt in range(2):
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=60))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"]
+            logger.info(f"🔍 [SEARCH] Результат: {len(text)} символов")
+            return text
+        except Exception as e:
+            logger.error(f"❌ [SEARCH] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 1:
+                await asyncio.sleep(2)
+    return None
+
+_transcribe_key_idx = 0
+
+async def transcribe_voice(audio_bytes, filename):
+    global _transcribe_key_idx
+    if not config.GROQ_KEYS:
+        logger.error("❌ [TRANSCRIBE] Нет Groq ключей")
+        return None
     
-    text_content = ""
+    key = config.GROQ_KEYS[_transcribe_key_idx % len(config.GROQ_KEYS)]
+    _transcribe_key_idx += 1
+    
+    import io
+    import requests as req
     try:
-        text_content = raw_response_obj.text
-    except ValueError:
-        logger.warning("⚠️ [JSON] Ответ API пуст (нет валидных частей текста). Пропускаю.")
-        return None
+        loop = asyncio.get_running_loop()
+        def do_request():
+            return req.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {key}"},
+                data={"model": "whisper-large-v3-turbo", "language": "ru"},
+                files={"file": (filename, io.BytesIO(audio_bytes), "audio/ogg")},
+                timeout=30,
+                proxies={"https": "http://15Uo6V:3HF2Fh@170.83.236.245:8000", "http": "http://15Uo6V:3HF2Fh@170.83.236.245:8000"},
+            )
+        resp = await loop.run_in_executor(None, do_request)
+        logger.info(f"🎤 [TRANSCRIBE] Groq ответ: {resp.status_code} -> {resp.text[:300]}")
+        data = resp.json()
+        text = data.get('text', '')
+        logger.info(f"🎤 [TRANSCRIBE] Распознано: {text[:100]}")
+        return text
     except Exception as e:
-        logger.error(f"⚠️ [JSON] Неизвестная ошибка при чтении текста: {e}")
+        logger.error(f"❌ [TRANSCRIBE] Ошибка: {e}")
         return None
-        
-    if not text_content: return None
+
+async def try_parse_or_repair_json(raw_text):
+    if not raw_text:
+        return None
 
     try:
-        return json.loads(clean_json_response(text_content))
+        return json.loads(clean_json_response(raw_text))
     except (json.JSONDecodeError, AttributeError, ValueError):
         logger.warning(f"⚠️ [JSON] Ошибка парсинга. Запускаю Аварийное Восстановление JSON.")
-        repair_prompt = f"Ответ AI содержит ошибку в JSON. Исправь его. ВАЖНО: Ответ должен быть в поле 'replies': ['текст']. Не используй поле 'text' для ответа. Вот нерабочий ответ:\n\n{text_content}"
-        repaired_response = await safe_generate_content(repair_prompt, temperature=0.0)
-        
-        if repaired_response:
+        repair_prompt = f"Ответ AI содержит ошибку в JSON. Исправь его. ВАЖНО: Ответ должен быть в поле 'replies': ['текст']. Не используй поле 'text' для ответа. Вот нерабочий ответ:\n\n{raw_text}"
+        repaired = await safe_generate_content(repair_prompt, temperature=0.0)
+        if repaired:
             try:
-                repaired_text = repaired_response.text
-                repaired_json = json.loads(clean_json_response(repaired_text))
+                repaired_json = json.loads(clean_json_response(repaired))
                 logger.info("✅ [JSON] Аварийное Восстановление JSON успешно!")
                 return repaired_json
             except Exception:
-                 logger.error(f"❌ [JSON] Аварийное Восстановление НЕ удалось.")
+                logger.error(f"❌ [JSON] Аварийное Восстановление НЕ удалось.")
     return None
 
 async def retrieve_memory(user_query, query_topic, state_manager):
     logger.info(f"🧠 [MEMORY] Запущен процесс воспоминания по теме: '{query_topic}'")
     
-    reflection_history = state_manager.state.get("reflection_history", [])
-    keywords = query_topic.split()
+    results = []
+    r1 = await query_rag(user_query, top_k=5)
+    if r1: results.append(r1)
+    if query_topic:
+        r2 = await query_rag(query_topic, top_k=5)
+        if r2: results.append(r2)
+    result = "\n---\n".join(results) if results else ""
     
-    scored_messages = []
-    for msg in reflection_history:
-        score = sum(1 for keyword in keywords if keyword.lower() in msg['content'].lower())
-        if score > 0: scored_messages.append((score, msg))
-            
-    scored_messages.sort(key=lambda x: x[0], reverse=True)
-    relevant_context = [msg for score, msg in scored_messages[:20]]
-    memory_packet_text = "\n".join([f"{m['role']}: {m['content']}" for m in relevant_context])
-    
-    memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот контекст из памяти:\n---\n{memory_packet_text}\n---\nТвоя задача — изучить контекст и ответить на вопрос: '{user_query}'. Следуй своему характеру. Если ответа нет, честно признайся."
+    if result:
+        memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот контекст из памяти:\n---\n{result}\n---\nТвоя задача — изучить контекст и ответить на вопрос: '{user_query}'. Если ты уже знаешь ответ из контекста диалога — используй его. Следуй своему характеру. Если ответа нет, честно признайся."
+    else:
+        memory_context = f"Пользователь спрашивает: '{user_query}'. Память пуста или произошла ошибка. Если ответа нет, честно признайся."
     
     return await process_user_input(user_query, state_manager, memory_context=memory_context)
 
 async def generate_reflection(state_manager):
     logger.info("💡 [REFLECTION] Запускаю процесс гибридной рефлексии...")
     recent_history = state_manager.state["chat_history"][-40:]
-    recent_history_text = "\n".join([f"{'Юзер' if m['role']=='user' else 'Бот'}: {m['content']}" for m in recent_history])
+    recent_history_text = "\n".join([f"[{m.get('ts','')}] {'Юзер' if m['role']=='user' else 'Бот'}: {m['content']}" for m in recent_history])
     
     reflection_history = state_manager.state["reflection_history"]
     if len(reflection_history) < 50: return []
@@ -156,8 +167,8 @@ async def generate_reflection(state_manager):
     
     prompt = f'<SYSTEM_REFLECT>Ты — ИИ-аналитик. Найди связи между НЕДАВНИМ и СТАРЫМ диалогом. Сгенерируй 1-2 "фоновые мысли" (наблюдения, шутки, темы для разговора). Верни JSON-список строк.</SYSTEM_REFLECT><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
-    raw_response_obj = await safe_generate_content(prompt, temperature=0.7)
-    parsed = await try_parse_or_repair_json(raw_response_obj)
+    raw_text = await safe_generate_content(prompt, temperature=0.7)
+    parsed = await try_parse_or_repair_json(raw_text)
     return parsed.get("thoughts", []) if parsed else []
 
 async def process_user_input(user_text, state_manager, memory_context=None):
@@ -191,7 +202,7 @@ async def process_user_input(user_text, state_manager, memory_context=None):
             system_alert = "<SYSTEM_ALERT>ВНИМАНИЕ: Ты обижен. Отвечай холодно/односложно, либо молчи. Если юзер извиняется, можешь простить (`forgive: true`).</SYSTEM_ALERT>"
         
     mood_instr = state_manager.get_mood_instruction()
-    history = "\n".join([f"{'Юзер' if m['role']=='user' else 'Ты'}: {m['content']}" for m in state_manager.state["chat_history"]])
+    history = "\n".join([f"[{m.get('ts','')}] {'Юзер' if m['role']=='user' else 'Ты'}: {m['content']}" for m in state_manager.state["chat_history"]])
     
     thoughts_block = ""
     if state_manager.state["background_thoughts"]:
@@ -214,8 +225,8 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         existing_tasks=existing_tasks_str
     )
     
-    raw_response_obj = await safe_generate_content(prompt)
-    parsed_json = await try_parse_or_repair_json(raw_response_obj)
+    raw_text = await safe_generate_content(prompt)
+    parsed_json = await try_parse_or_repair_json(raw_text)
     
     if parsed_json: 
         logger.info(f"📥 [DECISION] {parsed_json}")

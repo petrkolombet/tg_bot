@@ -51,7 +51,9 @@ class StateManager:
             os.replace(temp_file, self.filename)
 
     async def add_history(self, role, text):
-        new_message = {"role": role, "content": text}
+        msk = datetime.timezone(datetime.timedelta(hours=3))
+        ts = datetime.datetime.now(msk).strftime("%H:%M")
+        new_message = {"role": role, "content": text, "ts": ts}
         # Краткосрочная память для промпта
         self.state["chat_history"].append(new_message)
         self.state["chat_history"] = self.state["chat_history"][-50:]

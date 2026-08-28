@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters
 import config
 from bot_state import StateManager
 import bot_ai
-from bot_handlers import handle_message, background_tasks
+from bot_handlers import handle_message, handle_voice, background_tasks
 
 # Настройка логирования
 logging.basicConfig(
@@ -27,14 +27,16 @@ def main():
         logger.critical(f"❌ Файл промпта '{config.PROMPT_FILE}' не найден!"); return
     if not config.TELEGRAM_TOKEN or "YOUR_TOKEN" in config.TELEGRAM_TOKEN: 
         logger.critical("❌ TELEGRAM_TOKEN не установлен!"); return
-    if not bot_ai.init_ai(config.API_KEYS): 
-        logger.critical("❌ Не удалось инициализировать модель Gemini."); return
 
-    # Настройка прокси
-    os.environ['http_proxy'] = config.PROXY_URL
-    os.environ['https_proxy'] = config.PROXY_URL
-    os.environ['HTTP_PROXY'] = config.PROXY_URL
-    os.environ['HTTPS_PROXY'] = config.PROXY_URL
+    # Настройка прокси для прямого доступа в интернет (не для Gemini)
+    if config.PROXY_URL:
+        os.environ['http_proxy'] = config.PROXY_URL
+        os.environ['https_proxy'] = config.PROXY_URL
+        os.environ['HTTP_PROXY'] = config.PROXY_URL
+        os.environ['HTTPS_PROXY'] = config.PROXY_URL
+    # Gemini proxy на localhost — не через прокси
+    os.environ['no_proxy'] = '127.0.0.1,localhost'
+    os.environ['NO_PROXY'] = '127.0.0.1,localhost'
     
     # Инициализация состояния
     state_manager = StateManager(config.STATE_FILE)
@@ -47,7 +49,10 @@ def main():
     app.bot_data["process_user_input"] = bot_ai.process_user_input
     app.bot_data["retrieve_memory"] = bot_ai.retrieve_memory
     app.bot_data["generate_reflection"] = bot_ai.generate_reflection
+    app.bot_data["search_web"] = bot_ai.search_web
+    app.bot_data["transcribe_voice"] = bot_ai.transcribe_voice
 
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     
     if app.job_queue:
