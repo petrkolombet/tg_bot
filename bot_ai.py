@@ -137,13 +137,18 @@ async def try_parse_or_repair_json(raw_text):
 async def retrieve_memory(user_query, query_topic, state_manager):
     logger.info(f"🧠 [MEMORY] Запущен процесс воспоминания по теме: '{query_topic}'")
     
-    results = []
-    r1 = await query_rag(user_query, top_k=5)
-    if r1: results.append(r1)
+    r1 = r2 = ""
     if query_topic:
-        r2 = await query_rag(query_topic, top_k=5)
-        if r2: results.append(r2)
-    result = "\n---\n".join(results) if results else ""
+        r1, r2 = await asyncio.gather(
+            query_rag(user_query, top_k=5),
+            query_rag(query_topic, top_k=5),
+        )
+        r1 = r1 or ""
+        r2 = r2 or ""
+    result = "\n---\n".join(x for x in (r1, r2) if x)
+    logger.info(f"🧠 [MEMORY] Поиск по '{query_topic}': r1={len(r1)} симв, r2={len(r2)} симв, всего={len(result)} симв")
+    if result:
+        logger.info(f"🧠 [MEMORY] Первые 100 символов результата: {result[:100]!r}")
     
     if result:
         memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот контекст из памяти:\n---\n{result}\n---\nТвоя задача — изучить контекст и ответить на вопрос: '{user_query}'. Если ты уже знаешь ответ из контекста диалога — используй его. Следуй своему характеру. Если ответа нет, честно признайся."
@@ -151,6 +156,69 @@ async def retrieve_memory(user_query, query_topic, state_manager):
         memory_context = f"Пользователь спрашивает: '{user_query}'. Память пуста или произошла ошибка. Если ответа нет, честно признайся."
     
     return await process_user_input(user_query, state_manager, memory_context=memory_context)
+
+async def update_longterm_summary(state_manager):
+    """Обновляет долгосрочное саммари через DeepSeek каждые 50 сообщений."""
+    logger.info(f"📌 [SUMMARY] Запуск обновления саммари (messages_since_summary={state_manager.state.get('messages_since_summary', 0)})")
+
+    # Последние 50 сообщений диалога
+    recent = state_manager.state["chat_history"][-50:]
+    if not recent:
+        logger.warning("📌 [SUMMARY] Нет сообщений для саммари")
+        return
+
+    recent_text = "\n".join([f"[{m.get('ts','')}] {'Юзер' if m['role']=='user' else 'Бот'}: {m['content']}" for m in recent])
+    prev_summary = state_manager.state.get("summary", "")
+
+    system_prompt = (
+        "Ты — модуль долгосрочной памяти чат-бота. Тебе дадут: (1) прошлое саммари разговора (может быть пустым), "
+        "(2) новые 50 сообщений диалога.\n\n"
+        "Задача: обнови саммари.\n"
+        "- СОХРАНИ всю важную инфу из прошлого саммари: имена, отношения, важные события, решения, договорённости, планы, факты о пользователе.\n"
+        "- ДОБАВЬ новые важные факты из новых сообщений.\n"
+        "- ПИШИ ПРЕДЕЛЬНО СЖАТО И ПЛОТНО. ЖЁСТКИЙ ЛИМИТ: максимум 800 символов. Чем короче — тем лучше.\n"
+        "- Без воды, оценок, эпитетов, 'пользователь рассказал' и вводных фраз. Только суть: факты, решения, имена, договорённости.\n"
+        "- Используй короткие предложения и списки с '-'. 1 факт = 1 строка.\n"
+        "- Если часть старого саммари устарела/опровергнута — замени её, не дублируй.\n"
+        "- Приоритет: что важно помнить ДОЛГО, а не детали дня.\n\n"
+        "ОТВЕЧАЙ ТОЛЬКО САМИМ САММАРИ (до 800 символов), БЕЗ ОБЪЯСНЕНИЙ."
+    )
+
+    user_prompt = f"ПРОШЛОЕ САММАРИ:\n{prev_summary if prev_summary else '(пусто)'}\n\n---\n\nНОВЫЕ СООБЩЕНИЯ:\n{recent_text}"
+
+    payload = json.dumps({
+        "model": config.DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.3,
+        "user": "tg_bot_summary"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+        }
+    )
+
+    for attempt in range(2):
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=60))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"📌 [SUMMARY] Новое саммари (обновлено): {len(text)} символов")
+            await state_manager.set_summary(text)
+            return text
+        except Exception as e:
+            logger.error(f"❌ [SUMMARY] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 1:
+                await asyncio.sleep(2)
+    return None
 
 async def generate_reflection(state_manager):
     logger.info("💡 [REFLECTION] Запускаю процесс гибридной рефлексии...")
@@ -182,6 +250,7 @@ async def process_user_input(user_text, state_manager, memory_context=None):
     system_alert = ""
     memory_context_block = ""
     task_execution_block = ""
+    summary_block = ""
     
     # --- КЛЮЧЕВАЯ ЛОГИКА: ОПРЕДЕЛЕНИЕ ТИПА ВХОДА ---
     is_system_trigger = "[SYSTEM_TRIGGER:" in user_text
@@ -196,18 +265,18 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         # Обычная обработка сообщений пользователя
         if memory_context:
             memory_context_block = f"<MEMORY_CONTEXT>\n{memory_context}\n</MEMORY_CONTEXT>"
-        elif triggered_topic := state_manager.get_and_clear_pending_topic(user_text):
-            system_alert = f"<SYSTEM_ALERT>ВНИМАНИЕ: Пользователь второй раз вернулся к теме '{', '.join(triggered_topic)}'. Прояви интерес.</SYSTEM_ALERT>"
-        elif state_manager.is_offended():
-            system_alert = "<SYSTEM_ALERT>ВНИМАНИЕ: Ты обижен. Отвечай холодно/односложно, либо молчи. Если юзер извиняется, можешь простить (`forgive: true`).</SYSTEM_ALERT>"
         
     mood_instr = state_manager.get_mood_instruction()
     history = "\n".join([f"[{m.get('ts','')}] {'Юзер' if m['role']=='user' else 'Ты'}: {m['content']}" for m in state_manager.state["chat_history"]])
+
+    summary = state_manager.state.get("summary", "")
+    if summary:
+        summary_block = f"<SUMMARY>\nЭто твоя долгосрочная память о пользователе и ваших отношениях (имена, события, решения, факты). Помни это и опирайся на это в ответах:\n{summary}\n</SUMMARY>"
     
     thoughts_block = ""
     if state_manager.state["background_thoughts"]:
         thoughts_text = "\n".join([f'- ({t["id"]}) {t["text"]}' for t in state_manager.state["background_thoughts"]])
-        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли. ПРАВИЛО: Если разговор затухает, используй мысль.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
+        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания, а не просто украшение. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
     
     existing_tasks_list = state_manager.state.get("task_list", [])
     existing_tasks_str = "\n".join([f"- [{t['priority']}] {t.get('text', 'без темы')}" for t in existing_tasks_list])
@@ -220,6 +289,7 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         mood_instr=mood_instr, 
         thoughts_block=thoughts_block, 
         history=history,
+        summary_block=summary_block,
         task_execution_block=task_execution_block, # Вставляем блок выполнения задачи
         user_text=user_text, 
         existing_tasks=existing_tasks_str

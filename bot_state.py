@@ -24,12 +24,12 @@ class StateManager:
             "spike": 0.0, 
             "residual": 0.0,
             "last_interaction": datetime.datetime.now(timezone.utc).timestamp(),
-            "pending_topic": None,
             "background_thoughts": [],
             "last_reflection_time": 0,
-            "offense_state": {"active": False, "timestamp": 0},
             "is_at_peak": False,
-            "reflection_history": []
+            "reflection_history": [],
+            "summary": "",
+            "messages_since_summary": 0
         }
         if os.path.exists(self.filename):
             try:
@@ -61,7 +61,16 @@ class StateManager:
         # Долгосрочная память для рефлексии
         self.state.setdefault("reflection_history", []).append(new_message)
         self.state["reflection_history"] = self.state["reflection_history"][-400:]
+
+        # Счётчик для триггера обновления саммари (каждые 50 сообщений)
+        self.state["messages_since_summary"] = self.state.get("messages_since_summary", 0) + 1
         await self.save()
+
+    async def set_summary(self, summary_text):
+        self.state["summary"] = summary_text
+        self.state["messages_since_summary"] = 0
+        await self.save()
+        logger.info(f"📌 [SUMMARY] Саммари обновлено ({len(summary_text)} символов)")
 
     async def add_task(self, text, minutes, priority):
         due_time = (datetime.datetime.now(timezone.utc) + timedelta(minutes=minutes)).timestamp()
@@ -120,44 +129,6 @@ class StateManager:
             return "ТВОЕ СОСТОЯНИЕ: 🌤️ Нормальное. СТИЛЬ: Обычный дружеский диалог."
         else:
             return "ТВОЕ СОСТОЯНИЕ: ☀️ Хорошее. СТИЛЬ: Дружелюбный. Можно использовать `)` в конце фразы для теплоты, но не в каждом сообщении."
-
-    async def set_offense_state(self, active: bool):
-        self.state["offense_state"]["active"] = active
-        self.state["offense_state"]["timestamp"] = datetime.datetime.now(timezone.utc).timestamp() if active else 0
-        await self.save()
-        if active:
-            logger.warning("😡 [PSYCHOLOGY] Бот 'обиделся'.")
-        else:
-            logger.info("😌 [PSYCHOLOGY] Бот 'простил'.")
-
-    def is_offended(self):
-        offense = self.state["offense_state"]
-        if not offense["active"]:
-            return False
-        if (datetime.datetime.now(timezone.utc).timestamp() - offense["timestamp"]) > 600:
-            logger.info("😌 [PSYCHOLOGY] Время 'обиды' истекло.")
-            offense["active"] = False
-            return False
-        return True
-
-    async def set_pending_topic(self, keywords):
-        self.state["pending_topic"] = {"keywords": keywords, "timestamp": datetime.datetime.now(timezone.utc).timestamp()}
-        await self.save()
-        logger.info(f"🧠 [THINKING] Запомнил проигнорированную тему: {keywords}")
-
-    def get_and_clear_pending_topic(self, user_text):
-        topic = self.state.get("pending_topic")
-        if not topic:
-            return None
-        if (datetime.datetime.now(timezone.utc).timestamp() - topic["timestamp"]) > 900:
-            self.state["pending_topic"] = None
-            logger.info("🧠 [THINKING] Проигнорированная тема устарела.")
-            return None
-        if any(keyword.lower() in user_text.lower() for keyword in topic["keywords"]):
-            self.state["pending_topic"] = None
-            logger.info(f"🧠 [THINKING] Пользователь вернулся к теме: {topic['keywords']}.")
-            return topic["keywords"]
-        return None
 
     async def add_thoughts(self, thoughts):
         if not thoughts:

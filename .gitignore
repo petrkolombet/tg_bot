@@ -6,3 +6,4 @@ state.json
 *.log
 .venv/
 venv/
+workspace/

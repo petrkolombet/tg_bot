@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 
 import config
 from rag import insert_to_rag
+import server_access
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 decision = await process_user_input(user_text, state_manager, memory_context=search_context)
             else:
                 decision = initial_decision
+        elif initial_decision and initial_decision.get("server_command"):
+            server_cmd = initial_decision["server_command"]
+            ack_replies = initial_decision.get("replies") or []
+            if ack_replies:
+                ack_text = ack_replies[0] if isinstance(ack_replies[0], str) else ack_replies[0].get("text", "")
+                if ack_text:
+                    await update.message.reply_text(ack_text.lower())
+            logger.info(f"🖥️ [SERVER] Команда: {server_cmd}")
+            result = await server_access.execute(server_cmd, timeout=30)
+            output = result.get("output", "")
+            error = result.get("error", "")
+            logger.info(f"🖥️ [SERVER] output={len(output)} символов")
+            server_context = f"Результат выполнения команды '{server_cmd}':\n---\n{output}\n---"
+            if error:
+                server_context += f"\nОшибки:\n{error}"
+            decision = await process_user_input(user_text, state_manager, memory_context=server_context)
         else:
             decision = initial_decision
         
@@ -78,9 +95,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
             
-        if decision.get("forgive"): await state_manager.set_offense_state(False)
-        elif decision.get("is_offended"): await state_manager.set_offense_state(True)
-        if ignored_keywords := decision.get("ignored_topic_keywords"): await state_manager.set_pending_topic(ignored_keywords)
         if used_thought_id := decision.get("used_thought_id"): await state_manager.remove_thought(used_thought_id)
         if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
         
@@ -189,6 +203,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 decision = await process_user_input(text, state_manager, memory_context=search_context)
             else:
                 decision = initial_decision
+        elif initial_decision and initial_decision.get("server_command"):
+            server_cmd = initial_decision["server_command"]
+            ack_replies = initial_decision.get("replies") or []
+            if ack_replies:
+                ack_text = ack_replies[0] if isinstance(ack_replies[0], str) else ack_replies[0].get("text", "")
+                if ack_text:
+                    await update.message.reply_text(ack_text.lower())
+            logger.info(f"🖥️ [SERVER] Команда: {server_cmd}")
+            result = await server_access.execute(server_cmd, timeout=30)
+            output = result.get("output", "")
+            error = result.get("error", "")
+            logger.info(f"🖥️ [SERVER] output={len(output)} символов")
+            server_context = f"Результат выполнения команды '{server_cmd}':\n---\n{output}\n---"
+            if error:
+                server_context += f"\nОшибки:\n{error}"
+            decision = await process_user_input(text, state_manager, memory_context=server_context)
         else:
             decision = initial_decision
         
@@ -198,9 +228,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
         
-        if decision.get("forgive"): await state_manager.set_offense_state(False)
-        elif decision.get("is_offended"): await state_manager.set_offense_state(True)
-        if ignored_keywords := decision.get("ignored_topic_keywords"): await state_manager.set_pending_topic(ignored_keywords)
         if used_thought_id := decision.get("used_thought_id"): await state_manager.remove_thought(used_thought_id)
         if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
         
@@ -234,8 +261,16 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
     state_manager = context.bot_data["state_manager"]
     process_user_input = context.bot_data["process_user_input"]
     generate_reflection = context.bot_data["generate_reflection"]
+    update_longterm_summary = context.bot_data["update_longterm_summary"]
     
     now_ts = datetime.datetime.now(timezone.utc).timestamp()
+
+    # Обновление долгосрочного саммари каждые 50 сообщений
+    try:
+        if state_manager.state.get("messages_since_summary", 0) >= 50:
+            await update_longterm_summary(state_manager)
+    except Exception:
+        logger.error("💥 [CRON] Ошибка в обновлении саммари!", exc_info=True)
     
     try:
         if (now_ts - state_manager.state["last_interaction"]) > config.SILENCE_BEFORE_REFLECTION_HOURS * 3600 and \
@@ -295,7 +330,40 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.error("💥 [CRON] Ошибка в исполнителе задач!", exc_info=True)
 
-    try:
-        await state_manager.update_physics()
-    except Exception:
-        logger.error("💥 [CRON] Ошибка в обновлении физики!", exc_info=True)
+async def handle_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /server — выполнение команд на сервере."""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+
+    cmd_text = update.message.text.replace("/server", "").strip()
+    if not cmd_text:
+        await update.message.reply_text(
+            "команда: /server <shell-команда>\n\n"
+            "workspace (/root/tg_bot/workspace) — чтение/запись/запуск\n"
+            "вне workspace — только чтение и мониторинг"
+        )
+        return
+
+    await update.message.reply_text(f"⏳ выполняю: `{cmd_text}`", parse_mode="Markdown")
+
+    result = await server_access.execute(cmd_text, timeout=30)
+
+    mode_icon = {"write": "📝", "read": "📖", "monitor": "📊", "denied": "🚫"}.get(result["mode"], "❓")
+    header = f"{mode_icon} `{result['mode']}`"
+
+    output = result.get("output", "")
+    error = result.get("error", "")
+
+    parts = [header]
+    if output:
+        parts.append(f"```\n{output}\n```")
+    if error:
+        parts.append(f"⚠️\n```\n{error}\n```")
+
+    response = "\n".join(parts)
+
+    # Ограничиваем длину сообщения Telegram (4096 символов)
+    if len(response) > 4000:
+        response = response[:4000] + "\n... (обрезано)"
+
+    await update.message.reply_text(response, parse_mode="Markdown")

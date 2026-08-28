@@ -1,6 +1,8 @@
 import os
 import asyncio
 import logging
+import uuid
+import urllib.parse
 
 os.environ["no_proxy"] = "127.0.0.1,localhost"
 os.environ["NO_PROXY"] = "127.0.0.1,localhost"
@@ -26,6 +28,57 @@ DEEPSEEK_MODEL = "deepseek-chat"
 _agent = None
 
 
+class FreshSessionJSONClient(OpenAICompatibleJSONClient):
+    """Каждый вызов DeepSeek — свежая сессия (уникальный user), после ответа удаляется с DeepSeek и с диска."""
+
+    def complete_json(self, system_prompt, user_prompt):
+        import json
+        import urllib.request
+
+        user_id = f"tg_bot_rag_{uuid.uuid4().hex[:12]}"
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "user": user_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        request = urllib.request.Request(
+            url=f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            content = result["choices"][0]["message"]["content"]
+            parsed = self._parse_json_payload(content)
+        finally:
+            self._delete_session(user_id)
+        return parsed
+
+    def _delete_session(self, user_id):
+        try:
+            import urllib.request
+            base = self.base_url.rsplit("/v1", 1)[0]
+            req = urllib.request.Request(
+                url=f"{base}/session?agent={urllib.parse.quote(user_id)}",
+                method="DELETE",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалил сессию DeepSeek {user_id}: {e}")
+
+
 def _get_agent():
     global _agent
     if _agent is not None:
@@ -41,7 +94,7 @@ def _get_agent():
         background_write=False,
     )
 
-    client = OpenAICompatibleJSONClient(
+    client = FreshSessionJSONClient(
         model=DEEPSEEK_MODEL,
         base_url=f"{DEEPSEEK_URL}/v1",
         api_key=DEEPSEEK_KEY,
