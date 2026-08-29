@@ -119,8 +119,8 @@ class StateManager:
 
         for a in self.state.get("alarms", []):
             if a["text"] == text:
-                logger.info(f"⚠️ [ALARM] Дубликат будильника '{text}' пропущен.")
-                return
+                logger.info(f"⚠️ [ALARM] Дубликат будильника '{text}' пропущен. Возвращаю существующий id.")
+                return a["id"]
 
         self.state.setdefault("alarms", []).append({
             "id": alarm_id,
@@ -129,8 +129,9 @@ class StateManager:
             "missed": 0,
             "context": context
         })
-        logger.info(f"✅ [ALARM] Новый будильник '{text}' сработает через {minutes} мин.")
+        logger.info(f"✅ [ALARM] Новый будильник '{text}' сработает через {minutes} мин. id={alarm_id}")
         await self.save()
+        return alarm_id
 
     async def remove_alarm(self, alarm_id):
         initial_len = len(self.state.get("alarms", []))
@@ -139,6 +140,44 @@ class StateManager:
             logger.info(f"🗑️ [ALARM] Будильник {alarm_id} удалён.")
             await self.save()
             return True
+        return False
+
+    async def remove_alarm_by_text(self, text):
+        target = None
+        for a in self.state.get("alarms", []):
+            if a["text"] == text:
+                target = a
+                break
+        if not target:
+            logger.info(f"🗑️ [ALARM] Не нашёл будильник '{text}' — удалять нечего.")
+            return False
+        return await self.remove_alarm(target["id"])
+
+    async def edit_alarm(self, alarm_id, text=None, minutes=None):
+        alarms = self.state.get("alarms", [])
+        for a in alarms:
+            if a.get("id") == alarm_id:
+                if text is not None:
+                    a["text"] = text
+                if minutes is not None:
+                    a["due_ts"] = (datetime.datetime.now(timezone.utc) + timedelta(minutes=int(minutes))).timestamp()
+                logger.info(f"✏️ [ALARM] Будильник {alarm_id} отредактирован: text={a['text']!r}, due={a['due_ts']}")
+                await self.save()
+                return True
+        logger.info(f"✏️ [ALARM] Не нашёл будильник {alarm_id} — редактировать нечего.")
+        return False
+
+    async def edit_alarm_by_text(self, text, new_text=None, minutes=None):
+        for a in self.state.get("alarms", []):
+            if a["text"] == text:
+                if new_text is not None:
+                    a["text"] = new_text
+                if minutes is not None:
+                    a["due_ts"] = (datetime.datetime.now(timezone.utc) + timedelta(minutes=int(minutes))).timestamp()
+                logger.info(f"✏️ [ALARM] Будильник по тексту '{text}' отредактирован: text={a['text']!r}, due={a['due_ts']}")
+                await self.save()
+                return True
+        logger.info(f"✏️ [ALARM] Не нашёл будильник '{text}' — редактировать нечего.")
         return False
 
     async def bump_alarm_missed(self, alarm):

@@ -130,7 +130,10 @@ def _is_write_operation(cmd: str, target_path: str = None) -> bool:
 def _is_inside_workspace(path: str) -> bool:
     """Проверяет, находится ли путь внутри workspace."""
     try:
-        real_path = Path(path).resolve()
+        p = Path(path)
+        if not p.is_absolute():
+            p = WORKSPACE / p
+        real_path = p.resolve()
         real_workspace = WORKSPACE.resolve()
         return str(real_path).startswith(str(real_workspace))
     except Exception:
@@ -192,12 +195,36 @@ async def execute(cmd: str, timeout: int = 30) -> dict:
             "error": f"🚫 Запрещено: {reason}"
         }
 
+    sandbox_prefix = [
+        "bwrap", "--unshare-ipc",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind", "/run", "/run",
+        "--ro-bind", "/var", "/var",
+        "--ro-bind", "/root", "/root",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--setenv", "SYSTEMD_IGNORE_CHROOT", "1",
+        "--setenv", "HOME", str(WORKSPACE),
+        "--chdir", str(WORKSPACE),
+        "--dir", str(WORKSPACE),
+        "--bind", str(WORKSPACE), str(WORKSPACE),
+        "/bin/bash", "-c",
+    ]
+
     try:
-        proc = await asyncio.create_subprocess_shell(
+        proc = await asyncio.create_subprocess_exec(
+            *sandbox_prefix,
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "LANG": "C", "TERM": "dumb"},
+            cwd=WORKSPACE,
+            env={**os.environ, "LANG": "C", "TERM": "dumb", "HOME": str(WORKSPACE)},
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout

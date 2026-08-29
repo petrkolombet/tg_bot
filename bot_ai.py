@@ -62,7 +62,7 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
 
     system_prompt = (
         "Ты — модуль выжимки вывода shell-команды для чат-бота. "
-        "Тебе дадут: команду, ЗАЧЕМ она выполнялась (описание цели), "
+        "Тебе дают: команду, ЗАЧЕМ она выполнялась (описание цели), "
         "хвост диалога (контекст) и полный вывод команды. "
         "Сделай ОЧЕНЬ короткую выжимку вывода, максимально полезную именно для заявленной цели. "
         "Не упускай ничего, что относится к цели даже косвенно (например искомый токен или параметр). "
@@ -106,6 +106,63 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
             return text[:config.TOOL_RESULT_LIMIT]
         except Exception as e:
             logger.error(f"❌ [SUMMARY] Ошибка выжимки (попытка {attempt+1}): {e}")
+            if attempt < 1:
+                await asyncio.sleep(2)
+    # Fallback при ошибке дипсика — режем жадно
+    return output[:config.TOOL_RESULT_LIMIT] + f"\n... (всего {len(output)} симв.)"
+
+async def summarize_search_result(search_query, output, state_manager):
+    """Выжимка большого поискового результата через DeepSeek (≤ TOOL_RESULT_LIMIT).
+    Дипсику передаём оригинальный поисковый запрос + хвост переписки."""
+    if not output:
+        return ""
+    recent = state_manager.state["chat_history"][-10:]
+    recent_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in recent])
+
+    system_prompt = (
+        "Ты — модуль выжимки результатов веб-поиска для чат-бота. "
+        "Тебе дают: оригинальный поисковый запрос, хвост диалога (контекст) и полный результат поиска. "
+        "Сделай ОЧЕНЬ короткую выжимку, максимально полезную именно для этого запроса. "
+        "Не упускай ничего, что относится к запросу (факты, цифры, ссылки, имена). "
+        f"ЖЁСТКИЙ ЛИМИТ: максимум {config.TOOL_RESULT_LIMIT} символов. "
+        "Формат: 1-3 коротких предложения. Без вводных слов и пояснений, только суть выжимки."
+    )
+
+    user_prompt = (
+        f"ПОИСКОВЫЙ ЗАПРОС: {search_query}\n\n"
+        f"ПОСЛЕДНИЙ КОНТЕКСТ ДИАЛОГА:\n{recent_text}\n\n"
+        f"--- ПОЛНЫЙ РЕЗУЛЬТАТ ПОИСКА ---\n{output}"
+    )
+
+    payload = json.dumps({
+        "model": config.DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.3,
+        "user": "tg_bot_search_summary"
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+        }
+    )
+
+    for attempt in range(2):
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=60))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"✂️ [SUMMARY] Выжимка поиска: {len(text)} символов")
+            return text[:config.TOOL_RESULT_LIMIT]
+        except Exception as e:
+            logger.error(f"❌ [SUMMARY] Ошибка выжимки поиска (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
     # Fallback при ошибке дипсика — режем жадно
@@ -248,18 +305,19 @@ async def update_longterm_summary(state_manager):
     interests_text = "\n".join([f"- {t['id']}: {t['text']}" for t in interests]) if interests else "(нет)"
 
     system_prompt = (
-        "Ты — модуль долгосрочной памяти чат-бота. Тебе дадут: (1) прошлое саммари разговора (может быть пустым), "
-        "(2) новые 50 сообщений диалога, (3) список ИНТЕРЕСОВ (тем, которые бот хотел поднять).\n\n"
+        "Ты —  друг пользователя. Тебе дадут: (1) прошлое саммари разговора (может быть пустым), "
+        "(2) новые 50 сообщений вашего диалога, (3) список ИНТЕРЕСОВ (темы, которые ты хотел поднять).\n\n"
         "ЗАДАЧА 1 — обнови саммари:\n"
-        "- СОХРАНИ всю важную инфу из прошлого саммари: имена, отношения, важные события, решения, договорённости, планы, факты о пользователе.\n"
+        "- СОХРАНИ всю важную инфу из прошлого саммари: имена, ваши отношения, важные события, решения, договорённости, планы, факты о пользователе.\n"
         "- ДОБАВЬ новые важные факты из новых сообщений.\n"
-        "- ПИШИ ПРЕДЕЛЬНО СЖАТО И ПЛОТНО. ЖЁСТКИЙ ЛИМИТ: максимум 800 символов. Чем короче — тем лучше.\n"
-        "- Без воды, оценок, эпитетов, 'пользователь рассказал' и вводных фраз. Только суть: факты, решения, имена, договорённости.\n"
-        "- Используй короткие предложения и списки с '-'. 1 факт = 1 строка.\n"
+        "- ПИШИ  СЖАТО И ПЛОТНО, НЕ ТЕРЯЯ СМЫСЛ. ЖЁСТКИЙ ЛИМИТ: максимум 800 символов.\n"
+        "- Без воды, оценок, эпитетов, вводных фраз. Только суть: факты, решения, имена, договорённости.\n"
         "- Если часть старого саммари устарела/опровергнута — замени её, не дублируй.\n"
-        "- Приоритет: что важно помнить ДОЛГО, а не детали дня.\n\n"
+        "- Приоритет: что важно помнить ДОЛГО.\n"
+        "- ПИШИ ОТ ПЕРВОГО ЛИЦА: 'я', 'мне', 'мне показалось', 'я решил', 'я предложил'. Пример: 'Петя сказал X, я Y', 'Мы решили Z', 'Петя обиделся на меня за X', 'Я слелал X, но у меня не получилось'. Никаких упоминаний 'бот', 'модель', 'ассистент', 'ИИ', 'система'. Петя - пользователь. Ты - ео собеседник.\n"
+        "- НЕ включай в саммари данные о будильниках, напоминаниях, таймерах, алармах — они динамические, меняются и только мешают.\n\n"
         "ЗАДАЧА 2 — проверь ИНТЕРЕСЫ (темы из списка ниже): определи, какие из них ЯВНО уже выполнены в этих 50 сообщениях — "
-        "бот сам взял инициативу и спросил/сделал эту тему (сам начал разговор про неё, сам задал вопрос, сам предложил/напомнил). "
+        "когда тему начал Ты САМ, без запроса пользователя (сам начал разговор про неё, сам задал вопрос, сам предложил/напомнил). "
         "Помечай как выполненную ТОЛЬКО такие темы. Если тема лишь упоминалась вскользь или её поднял сам пользователь — НЕ помечай. Не надумывай, никаких ложных срабатываний.\n\n"
         "ОТВЕЧАЙ ТОЛЬКО JSON (без объяснений): {\"summary\": \"саммари до 800 символов\", \"done_interests\": [\"id1\", \"id2\"]}. "
         "done_interests — список id выполненных интересов (может быть пустым)."
@@ -268,7 +326,7 @@ async def update_longterm_summary(state_manager):
     user_prompt = (
         f"ПРОШЛОЕ САММАРИ:\n{prev_summary if prev_summary else '(пусто)'}\n\n"
         f"---\n\nНОВЫЕ СООБЩЕНИЯ:\n{recent_text}\n\n"
-        f"---\n\nИНТЕРЕСЫ (темы, которые бот хотел поднять):\n{interests_text}"
+        f"---\n\nИНТЕРЕСЫ (темы, которые ты хотел поднять):\n{interests_text}"
     )
 
     payload = json.dumps({
@@ -329,7 +387,7 @@ async def generate_reflection(state_manager):
     older_context = reflection_history[older_context_start_index:older_context_end_index]
     older_context_text = "\n".join([f"{render_role(m['role'])}: {m['content']}" for m in older_context])
     
-    prompt = f'<SYSTEM_REFLECT>Ты — ИИ-аналитик. Найди связи между НЕДАВНИМ и СТАРЫМ диалогом. Сгенерируй 1-2 "фоновые мысли" (наблюдения, шутки, темы для разговора). Верни JSON-список строк.</SYSTEM_REFLECT><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
+    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — свой внутренний монолог. Прочитай свой недавний и старый диалог с ползователем и создай 1-2 мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям и глубоким. Замечай то, чего не говорили, но чувствовали. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговлра. О чем то радуешься, беспокоишься, привыкаешь, злишся, обижаешься? Пример(не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, твои мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злосью или чем-то совершенно другим или смешанным. Описывай мысли максимально чуственно, используй прилагательные и слова которые точно описывают твои мысли. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
     raw_text = await safe_generate_content(prompt, temperature=0.7)
     parsed = await try_parse_or_repair_json(raw_text)
@@ -367,12 +425,12 @@ async def process_user_input(user_text, state_manager, memory_context=None):
 
     summary = state_manager.state.get("summary", "")
     if summary:
-        summary_block = f"<SUMMARY>\nЭто твоя долгосрочная память о пользователе и ваших отношениях (имена, события, решения, факты). Помни это и опирайся на это в ответах:\n{summary}\n</SUMMARY>"
+        summary_block = f"<SUMMARY>\nЭто твоя долгосрочная память о Пете и ваших отношениях (имена, события, решения, факты). Помни это и опирайся на это в ответах:\n{summary}\n</SUMMARY>"
     
     thoughts_block = ""
     if state_manager.state["background_thoughts"]:
         thoughts_text = "\n".join([f'- ({t["id"]}) {t["text"]}' for t in state_manager.state["background_thoughts"]])
-        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания, а не просто украшение. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
+        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания и чувства. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Используй мысли чтобы сказать о чем ты думаешь. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
     
     alarms_block = ""
     alarms = state_manager.state.get("alarms", [])
@@ -390,7 +448,7 @@ async def process_user_input(user_text, state_manager, memory_context=None):
     if interests:
         lines = [f"- [💬] {t['text']} [id:{t['id']}]" for t in interests]
         if lines:
-            interests_block = "💬 Темы, которые ты хотел поднять/сделать. Используй, когда это уместно по ходу разговора:\n" + "\n".join(lines)
+            interests_block = "💬 Темы, которые ты хотел поднять/сделать. Используй, когда это уместно по ходу разговора.\n" + "\n".join(lines)
         
     prompt = prompt_template.format(
         memory_context_block=memory_context_block, 
