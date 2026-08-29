@@ -17,6 +17,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)

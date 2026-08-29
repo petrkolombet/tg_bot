@@ -46,6 +46,14 @@ REFLECTION_INTERVAL_HOURS = 1
 SILENCE_BEFORE_REFLECTION_HOURS = 0.15
 SILENCE_BEFORE_PROACTIVE_MINUTES = 30
 
+# --- Будильники и темы ---
+ALARM_MAX_MISSES = 2
+ALARM_CONTEXT_SNIPPET = 8
+INTEREST_FOLLOWUP_COOLDOWN_MINUTES = 30
+
+# --- Вывод инструментов в истории ---
+TOOL_RESULT_LIMIT = 250  # вывод ≤250 → целиком в историю; >250 → выжимка/факт
+
 # --- Параметры "человечности" ---
 TYPO_CHANCE = 0.15
 FALLBACK_PHRASES = ["отвлекли щас", "телега подвисла кажется", "подожди", "щас", "сек"]
