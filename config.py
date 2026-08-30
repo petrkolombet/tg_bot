@@ -23,16 +23,30 @@ GEMINI_PROXY_URL = os.getenv('GEMINI_PROXY_URL', 'http://127.0.0.1:4984')
 GEMINI_PROXY_KEY = os.getenv('GEMINI_PROXY_KEY', 'sk-gemini')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.6-flash')
 
-# --- DeepSeek (саммари, выжимки тулов/поиска) ---
+# --- DeepSeek (ТОЛЬКО агентный поиск) ---
 DEEPSEEK_PROXY_URL = os.getenv('DEEPSEEK_PROXY_URL', 'http://127.0.0.1:9655')
 DEEPSEEK_PROXY_KEY = os.getenv('DEEPSEEK_PROXY_KEY', 'sk-freedeepseek')
 DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
 
-# --- DeepSeek (рефлексия / фоновые мысли) ---
-REFLECTION_PROXY_URL = os.getenv('REFLECTION_PROXY_URL', 'http://127.0.0.1:9655')
-REFLECTION_PROXY_KEY = os.getenv('REFLECTION_PROXY_KEY', 'sk-freedeepseek')
-REFLECTION_MODEL = os.getenv('REFLECTION_MODEL', 'deepseek-reasoner')
+# --- Саммари / выжимки (отдельный провайдер) ---
+# Пока SUMMARY_* не заполнены в .env — временно указывают на старый DeepSeek-прокси.
+SUMMARY_PROXY_URL = os.getenv('SUMMARY_PROXY_URL', DEEPSEEK_PROXY_URL)
+SUMMARY_PROXY_KEY = os.getenv('SUMMARY_PROXY_KEY', DEEPSEEK_PROXY_KEY)
+SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', DEEPSEEK_MODEL)
+
+# --- ChatGPT фолбек (анонимный скрапер, когда SUMMARY-провайдер упал) ---
+CHATGPT_FALLBACK_URL = os.getenv('CHATGPT_FALLBACK_URL', 'http://127.0.0.1:5040')
+CHATGPT_FALLBACK_KEY = os.getenv('CHATGPT_FALLBACK_KEY', 'anon')
+
+# --- Рефлексия / фоновые мысли (тот же SUMMARY-провайдер, своя модель) ---
+REFLECTION_PROXY_URL = os.getenv('REFLECTION_PROXY_URL', SUMMARY_PROXY_URL)
+REFLECTION_PROXY_KEY = os.getenv('REFLECTION_PROXY_KEY', SUMMARY_PROXY_KEY)
+REFLECTION_MODEL = os.getenv('REFLECTION_MODEL', SUMMARY_MODEL)
 REFLECTION_TEMPERATURE = float(os.getenv('REFLECTION_TEMPERATURE', '0.7'))
+
+# --- Perplexity (фолбек-поиск, бесплатный web-эндпоинт) ---
+PERPLEXITY_COOKIE = os.getenv('PERPLEXITY_COOKIE', '')
+PERPLEXITY_RW_TOKEN = os.getenv('PERPLEXITY_RW_TOKEN', '')
 
 # --- Groq (для транскрипции голосовых) ---
 GROQ_KEYS = []
@@ -64,7 +78,8 @@ INTEREST_FOLLOWUP_COOLDOWN_MINUTES = 30
 
 # --- Вывод инструментов в истории ---
 TOOL_RESULT_LIMIT = 250  # вывод ≤250 → целиком в историю; >250 → выжимка/факт
-MAX_TOOLS_TURN = 5  # максимум инструментов (команды/поиск/воспоминания) подряд на одно сообщение; дальше — принудительный текстовый ответ
+SUMMARY_INPUT_LIMIT = 1500  # в DeepSeek-выжимку слать максимум столько симв. вывода (хвост отбрасывается)
+MAX_TOOLS_TURN = 8  # максимум инструментов (команды/поиск/воспоминания) подряд на одно сообщение; дальше — принудительный текстовый ответ
 
 # --- Параметры "человечности" ---
 TYPO_CHANCE = 0.15

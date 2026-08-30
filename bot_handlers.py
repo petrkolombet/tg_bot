@@ -13,7 +13,7 @@ import config
 from rag import insert_to_rag
 import server_access
 import tools_registry
-from bot_ai import summarize_tool_output, summarize_search_result
+from bot_ai import summarize_tool_output
 
 logger = logging.getLogger(__name__)
 
@@ -343,11 +343,10 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             logger.info(f"🔍 [SEARCH] Запрос к поиску: {search_query}")
             search_result = await search_web(search_query)
             if search_result:
-                # В память — выжимка (или целиком, если коротко), как у команд
-                if len(search_result) <= config.TOOL_RESULT_LIMIT:
-                    search_report = search_result
-                else:
-                    search_report = await summarize_search_result(search_query, search_result, state_manager)
+                # В память — результат поиска, жадно обрезанный до лимита (без DeepSeek-выжимки)
+                search_report = search_result[:config.TOOL_RESULT_LIMIT]
+                if len(search_result) > config.TOOL_RESULT_LIMIT:
+                    search_report += f"\n... (всего {len(search_result)} симв.)"
                 await state_manager.add_tool_record(f'🌐 искал: "{search_query}" → {search_report}')
                 search_context = f"Результат поиска по запросу '{search_query}':\n---\n{search_result}\n---"
                 decision = await process_user_input(user_text, state_manager, memory_context=search_context)

@@ -87,11 +87,34 @@ async def safe_generate_deepseek(prompt, temperature=0.7, proxy_url=None, proxy_
                 await asyncio.sleep(2)
     return None
 
+async def _summary_fallback(payload_dict, tag="SUMMARY"):
+    """Фолбек на анонимный ChatGPT-скрапер, если основной SUMMARY-провайдер упал."""
+    try:
+        req = urllib.request.Request(
+            f"{config.CHATGPT_FALLBACK_URL}/v1/chat/completions",
+            data=json.dumps(payload_dict).encode('utf-8'),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {config.CHATGPT_FALLBACK_KEY}"
+            }
+        )
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=120))
+        data = json.loads(resp.read().decode('utf-8'))
+        text = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"🆘 [{tag}] Фолбек на ChatGPT сработал: {len(text)} символов")
+        return text
+    except Exception as e:
+        logger.error(f"❌ [{tag}] Фолбек на ChatGPT не сработал: {e}")
+        return None
+
 async def summarize_tool_output(cmd, purpose, output, state_manager):
     """Выжимка большого вывода команды через DeepSeek (≤ TOOL_RESULT_LIMIT).
     Дипсику даём desc (зачем вызывали) + хвост переписки, чтобы выжимка была полезной."""
     if not output:
         return ""
+    if len(output) > config.SUMMARY_INPUT_LIMIT:
+        output = output[:config.SUMMARY_INPUT_LIMIT] + f"\n…(обрезано, всего {len(output)} симв.)"
     recent = state_manager.state["chat_history"][-10:]
     recent_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in recent])
 
@@ -112,22 +135,22 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
         f"--- ПОЛНЫЙ ВЫВОД ---\n{output}"
     )
 
-    payload = json.dumps({
-        "model": config.DEEPSEEK_MODEL,
+    payload_dict = {
+        "model": config.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3,
         "user": "tg_bot_tool_summary"
-    }).encode('utf-8')
+    }
 
     req = urllib.request.Request(
-        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
-        data=payload,
+        f"{config.SUMMARY_PROXY_URL}/v1/chat/completions",
+        data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
         }
     )
 
@@ -143,7 +166,11 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
             logger.error(f"❌ [SUMMARY] Ошибка выжимки (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
-    # Fallback при ошибке дипсика — режем жадно
+    # Фолбек на ChatGPT (Алиса упала)
+    fb = await _summary_fallback(payload_dict, "SUMMARY")
+    if fb:
+        return fb[:config.TOOL_RESULT_LIMIT]
+    # Финальный фолбек при полном отказе — режем жадно
     return output[:config.TOOL_RESULT_LIMIT] + f"\n... (всего {len(output)} симв.)"
 
 async def summarize_search_result(search_query, output, state_manager):
@@ -151,6 +178,8 @@ async def summarize_search_result(search_query, output, state_manager):
     Дипсику передаём оригинальный поисковый запрос + хвост переписки."""
     if not output:
         return ""
+    if len(output) > config.SUMMARY_INPUT_LIMIT:
+        output = output[:config.SUMMARY_INPUT_LIMIT] + f"\n…(обрезано, всего {len(output)} симв.)"
     recent = state_manager.state["chat_history"][-10:]
     recent_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in recent])
 
@@ -169,22 +198,22 @@ async def summarize_search_result(search_query, output, state_manager):
         f"--- ПОЛНЫЙ РЕЗУЛЬТАТ ПОИСКА ---\n{output}"
     )
 
-    payload = json.dumps({
-        "model": config.DEEPSEEK_MODEL,
+    payload_dict = {
+        "model": config.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3,
         "user": "tg_bot_search_summary"
-    }).encode('utf-8')
+    }
 
     req = urllib.request.Request(
-        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
-        data=payload,
+        f"{config.SUMMARY_PROXY_URL}/v1/chat/completions",
+        data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
         }
     )
 
@@ -200,19 +229,82 @@ async def summarize_search_result(search_query, output, state_manager):
             logger.error(f"❌ [SUMMARY] Ошибка выжимки поиска (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
-    # Fallback при ошибке дипсика — режем жадно
+    # Фолбек на ChatGPT (Алиса упала)
+    fb = await _summary_fallback(payload_dict, "SUMMARY-SEARCH")
+    if fb:
+        return fb[:config.TOOL_RESULT_LIMIT]
+    # Финальный фолбек при полном отказе — режем жадно
     return output[:config.TOOL_RESULT_LIMIT] + f"\n... (всего {len(output)} симв.)"
+
+def perplexity_search(query):
+    if not config.PERPLEXITY_COOKIE or not config.PERPLEXITY_RW_TOKEN:
+        return None
+    import uuid as _uuid
+    params = {
+        "last_backend_uuid": str(_uuid.uuid4()),
+        "frontend_uuid": str(_uuid.uuid4()),
+        "read_write_token": config.PERPLEXITY_RW_TOKEN,
+        "query_source": "user",
+        "source": "default",
+        "mode": "copilot",
+        "model_preference": "turbo",
+        "search_focus": "internet",
+        "sources": ["web"],
+        "use_schematized_api": True,
+        "version": "2.18",
+        "supports_tool_approval_modal": True,
+        "is_related_query": False,
+        "language": "ru-RU",
+    }
+    body = json.dumps({"params": params, "query_str": query}, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(
+        "https://www.perplexity.ai/rest/sse/perplexity_ask",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/json",
+            "Origin": "https://www.perplexity.ai",
+            "Referer": "https://www.perplexity.ai/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+            "Cookie": config.PERPLEXITY_COOKIE,
+        },
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=90)
+        chunk = resp.read().decode('utf-8', 'replace')
+    except Exception as e:
+        logger.error(f"❌ [PERPLEXITY] запрос упал: {e}")
+        return None
+    parts = []
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line.startswith('data:'):
+            continue
+        try:
+            ev = json.loads(line[5:].strip())
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get('type') == 'answer':
+            c = ev.get('content')
+            if isinstance(c, dict) and c.get('text'):
+                parts.append(c['text'])
+    out = ' '.join(parts).strip()
+    if out:
+        logger.info(f"🔍 [PERPLEXITY] фолбек-поиск: {len(out)} символов")
+    return out or None
 
 async def search_web(query):
     logger.info(f"🔍 [SEARCH] Поиск: {query}")
     payload = json.dumps({
         "model": config.DEEPSEEK_MODEL,
         "messages": [
-            {"role": "system", "content": "Ты — поисковый агент. Отвечай КОРОТКО и ТОЛЬКО по заданию. Всегда добавляй ссылки на источники. Не пиши воду, не объясняй контекст — только факт и ссылка."},
             {"role": "user", "content": query}
         ],
         "temperature": 0.3,
-        "search": True
+        "search": True,
+        "user": "tg_bot_search"
     }).encode('utf-8')
 
     req = urllib.request.Request(
@@ -236,6 +328,11 @@ async def search_web(query):
             logger.error(f"❌ [SEARCH] Ошибка (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: perplexity_search(query))
+    except Exception as e:
+        logger.error(f"❌ [PERPLEXITY] фолбек-ошибка: {e}")
     return None
 
 _transcribe_key_idx = 0
@@ -364,22 +461,22 @@ async def update_longterm_summary(state_manager):
         f"---\n\nИНТЕРЕСЫ (темы, которые ты хотел поднять):\n{interests_text}"
     )
 
-    payload = json.dumps({
-        "model": config.DEEPSEEK_MODEL,
+    payload_dict = {
+        "model": config.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3,
         "user": "tg_bot_summary"
-    }).encode('utf-8')
+    }
 
     req = urllib.request.Request(
-        f"{config.DEEPSEEK_PROXY_URL}/v1/chat/completions",
-        data=payload,
+        f"{config.SUMMARY_PROXY_URL}/v1/chat/completions",
+        data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.DEEPSEEK_PROXY_KEY}"
+            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
         }
     )
 
@@ -407,6 +504,11 @@ async def update_longterm_summary(state_manager):
             logger.error(f"❌ [SUMMARY] Ошибка (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
+    # Фолбек на ChatGPT (Алиса упала) — сохраняем сырой текст, JSON не ждём
+    fb = await _summary_fallback(payload_dict, "SUMMARY-LONG")
+    if fb:
+        await state_manager.set_summary(fb)
+        return fb
     return None
 
 async def generate_reflection(state_manager):
@@ -428,7 +530,14 @@ async def generate_reflection(state_manager):
     
     prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — свой внутренний монолог. Прочитай свой недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям и глубоким. Замечай то, чего не говорили, но чувствовали. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговлра. О чем то радуешься, беспокоишься, привыкаешь, злишся, обижаешься? Пример(не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, твои мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злосью или чем-то совершенно другим или смешанным. Описывай мысли максимально чуственно, используй прилагательные и слова которые точно описывают твои мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
-    raw_text = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.REFLECTION_PROXY_URL, proxy_key=config.REFLECTION_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection")
+    raw_text = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection")
+    if not raw_text:
+        fb_dict = {
+            "model": config.REFLECTION_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": config.REFLECTION_TEMPERATURE,
+        }
+        raw_text = await _summary_fallback(fb_dict, "REFLECTION")
     parsed = await try_parse_or_repair_json(raw_text)
     return parsed.get("thoughts", []) if parsed else []
 

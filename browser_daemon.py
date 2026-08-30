@@ -221,13 +221,14 @@ class BrowserManager:
 
     # ---------- снапшот ----------
 
-    def _snapshot_refs(self, max_refs=60, text_limit=1200):
+    def _collect_refs(self, max_refs, max_dups=3, skip_names=None):
         refs = []
-        self.refs = {}
+        seen = {}
+        skip_names = skip_names or set()
         try:
             locators = self.page.locator(SELECTOR).all()
         except Exception:
-            return refs, ""
+            return refs
         i = 0
         for loc in locators:
             if i >= max_refs:
@@ -240,22 +241,76 @@ class BrowserManager:
                 for key in ("aria-label", "placeholder", "title", "value", "alt"):
                     v = loc.get_attribute(key)
                     if v:
-                        name = (v or "").strip()
+                        name = re.sub(r"\s+", " ", (v or "")).strip()
                         break
                 if not name:
                     try:
-                        txt = (loc.inner_text(timeout=2000) or "").strip().replace("\n", " ")
+                        txt = loc.inner_text(timeout=2000) or ""
                     except Exception:
                         txt = ""
-                    name = txt[:80]
+                    name = re.sub(r"\s+", " ", txt).strip()
+                href = ""
+                if tag == "a":
+                    href = (loc.get_attribute("href") or "").strip()
+                # Мусор-фильтры: безликие ссылки-скрипты, новостные атрибуции,
+                # HTML-обрывки в тексте, дубли заголовков (новостные карточки)
+                if not name and (href.startswith("javascript:") or not href):
+                    continue
+                if name.startswith("©") or name.startswith("<") and name.endswith(">"):
+                    continue
+                if name in skip_names:
+                    continue
+                name = name[:80]
+                extra = ""
+                if tag == "a" and href.startswith(("http:", "https:", "/")):
+                    path = href.split("?", 1)[0][:60]
+                    extra = f" → {path}"
+                desc = f'{tag} "{name}"{extra}'.replace('""', "").strip()
+                seen[desc] = seen.get(desc, 0) + 1
+                if seen[desc] > max_dups:
+                    continue
                 ref = f"e{i}"
-                refs.append({"ref": ref, "desc": f'{tag} "{name}"'.replace('""', "").strip()})
+                refs.append({"ref": ref, "desc": desc})
                 self.refs[ref] = loc
                 i += 1
             except Exception:
                 continue
-        text = self._page_text(limit=text_limit)
-        return refs, text
+        return refs
+
+    def _snapshot_refs(self, max_refs=30, skip_names=None):
+        """Список кликабельных элементов. Если пусто — JS не догрузился,
+        ждём секунду (страницы вроде Bing дорисовывают контент после load)."""
+        self.refs = {}
+        refs = self._collect_refs(max_refs, skip_names=skip_names)
+        if not refs:
+            try:
+                self.page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            self.refs = {}
+            refs = self._collect_refs(max_refs, skip_names=skip_names)
+        return refs
+
+    def _page_headings(self, limit=200):
+        """Заголовки h1–h3 — «о чём страница», без простыни body."""
+        try:
+            hs = self.page.locator("h1, h2, h3").all()
+        except Exception:
+            return ""
+        seen = []
+        for h in hs:
+            try:
+                if not h.is_visible():
+                    continue
+                t = (h.inner_text(timeout=2000) or "").strip().replace("\n", " ")
+                if t and t not in seen:
+                    seen.append(t)
+            except Exception:
+                continue
+        text = " | ".join(seen)
+        if len(text) > limit:
+            text = text[:limit] + "…"
+        return text
 
     def _page_text(self, limit=20000):
         try:
@@ -278,22 +333,31 @@ class BrowserManager:
         self.ensure_started(profile)
         self._prune_extra_pages()
         self.page.goto(url, wait_until="load", timeout=NAV_TIMEOUT)
+        try:
+            self.page.wait_for_timeout(1500)
+        except Exception:
+            pass
         self.save_state()
         self._touch()
         return self.snapshot(include_text=False)
 
-    def snapshot(self, include_text=True, text_limit=1200):
+    def snapshot(self, include_text=False, text_limit=1200):
+        """Паспорт страницы: заголовки (о чём) + кликабельные элементы (что можно сделать).
+        Текст страницы — только при include_text=True (или через dump)."""
         self.ensure_started()
         self._prune_extra_pages()
-        refs, text = self._snapshot_refs(text_limit=text_limit)
-        self._touch()
+        headings = self._page_headings()
+        skip = set(h.strip() for h in headings.split("|") if h.strip())
+        refs = self._snapshot_refs(skip_names=skip)
         out = {
             "url": self.page.url,
             "title": self.page.title() if self.page else "",
+            "headings": headings,
             "actions": "\n".join(f"{r['ref']}: {r['desc']}" for r in refs) or "(нет действий)",
         }
         if include_text:
-            out["text"] = text
+            out["text"] = self._page_text(limit=text_limit)
+        self._touch()
         return out
 
     def click(self, ref):
@@ -301,7 +365,7 @@ class BrowserManager:
         self._prune_extra_pages()
         loc = self.refs.get(ref)
         if loc is None:
-            self._snapshot_refs(text_limit=0)
+            self._snapshot_refs()
             if ref not in self.refs:
                 raise ValueError(
                     f"ref {ref!r} невалиден (страница могла обновиться). Вызови snapshot() заново."
@@ -340,6 +404,10 @@ class BrowserManager:
         self.ensure_started()
         self._prune_extra_pages()
         self.page.reload(timeout=NAV_TIMEOUT)
+        try:
+            self.page.wait_for_timeout(1500)
+        except Exception:
+            pass
         self.save_state()
         self._touch()
         return self.snapshot(include_text=False)
