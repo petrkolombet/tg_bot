@@ -50,12 +50,12 @@ BUILTIN_TOOLS = {
     },
     "search": {
         "name": "search",
-        "description": "Веб-поиск по запросу (через DeepSeek-агента).",
+        "description": "Поисковый ИИ-агент: ищет в интернете, возвращает свежие детали и ссылки.",
         "methods": {
             "run": {
-                "description": "Поиск в интернете",
+                "description": "Найти в интернете",
                 "params": [
-                    {"name": "query", "type": "str", "required": True, "description": "поисковый запрос"},
+                    {"name": "query", "type": "str", "required": True, "description": "запрос — полной фразой, как к поисковику (не ключевики)"},
                 ],
             }
         },

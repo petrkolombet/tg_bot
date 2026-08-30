@@ -337,6 +337,49 @@ def perplexity_search(query):
         logger.info(f"🔍 [PERPLEXITY] фолбек-поиск: {len(out)} символов")
     return out or None
 
+def _g4f_search_cleanup(text):
+    """g4f-Gemini склеивает черновик и финальный ответ с дублями цитат.
+    Финальный ответ идёт ПОСЛЕ последней 'черновой' вложенной цитаты вида
+    [[N]]([url](url). Если таких нет — возвращаем текст как есть."""
+    ends = [m.end() for m in re.finditer(r'\[\[\d+\]\]\(\[[^\]]*\]\([^)]*\)', text)]
+    if ends:
+        text = text[ends[-1]:]
+    return text.strip()
+
+
+async def search_web_g4f(query):
+    """Фолбек-поиск через g4f.space /api/Gemini (реальный gemini.google.com
+    на чужих аккаунтах) с web_search=True. Кредиты — через G4F_PROXY (тот же
+    IP, что у бейкера). Ретраи при 429/сбоях. Возвращает текст или None."""
+    payload = json.dumps({
+        "model": "gemini-2.5-flash",
+        "messages": [{"role": "user", "content": f"Найди в интернете и ответь БЕЗ лишних слов: {query}"}],
+        "temperature": 0.3,
+        "web_search": True
+    }).encode('utf-8')
+    url = "https://g4f.space/api/Gemini/chat/completions"
+
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(req, timeout=150))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"]
+            if text:
+                text = _g4f_search_cleanup(text)
+                logger.info(f"🔍 [SEARCH-G4F] Результат: {len(text)} символов")
+                return text
+        except Exception as e:
+            logger.error(f"❌ [SEARCH-G4F] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 1:
+                await asyncio.sleep(3)
+    return None
+
 async def search_web(query):
     logger.info(f"🔍 [SEARCH] Поиск: {query}")
     payload = json.dumps({
@@ -364,6 +407,8 @@ async def search_web(query):
             resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=60))
             data = json.loads(resp.read().decode('utf-8'))
             text = data["choices"][0]["message"]["content"]
+            text = re.sub(r'\[citation:\d+\]', '', text)
+            text = re.sub(r'\s+([.,;:!?])', r'\1', text).strip()
             logger.info(f"🔍 [SEARCH] Результат: {len(text)} символов")
             return text
         except Exception as e:
@@ -371,10 +416,12 @@ async def search_web(query):
             if attempt < 1:
                 await asyncio.sleep(2)
     try:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: perplexity_search(query))
+        g4f_result = await search_web_g4f(query)
+        if g4f_result:
+            return g4f_result
+        logger.error("❌ [SEARCH-G4F] фолбек вернул пусто")
     except Exception as e:
-        logger.error(f"❌ [PERPLEXITY] фолбек-ошибка: {e}")
+        logger.error(f"❌ [SEARCH-G4F] фолбек-ошибка: {e}")
     return None
 
 _transcribe_key_idx = 0
