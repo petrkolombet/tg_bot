@@ -23,7 +23,6 @@ def render_role(role):
     return "user" if role == "user" else "assistant"
 
 async def safe_generate_content(prompt, temperature=0.85):
-    logger.info(f"📤 [GEMINI] Отправка промпта длиной: {len(prompt)} символов")
     payload = json.dumps({
         "model": config.GEMINI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -45,7 +44,6 @@ async def safe_generate_content(prompt, temperature=0.85):
             resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=180))
             data = json.loads(resp.read().decode('utf-8'))
             text = data["choices"][0]["message"]["content"]
-            logger.info(f"📤 [GEMINI] Ответ получен, длина: {len(text)} символов")
             return text
         except Exception as e:
             logger.error(f"❌ [GEMINI] Ошибка (попытка {attempt+1}): {e}")
@@ -511,6 +509,6 @@ async def process_user_input(user_text, state_manager, memory_context=None):
     raw_text = await safe_generate_content(prompt)
     parsed_json = await try_parse_or_repair_json(raw_text)
     
-    if parsed_json: 
-        logger.info(f"📥 [DECISION] {parsed_json}")
+    if parsed_json:
+        logger.info(f"📥 [GEMINI] {len(prompt)} → {len(raw_text or '')} симв {parsed_json}")
     return parsed_json

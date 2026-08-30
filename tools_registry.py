@@ -12,6 +12,7 @@
 """
 
 import ast
+import json
 import logging
 import os
 import re
@@ -19,11 +20,18 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-TOOLS_DIR = Path("/root/tg_bot/workspace/tools")
+WORKSPACE_DIR = Path("/root/tg_bot/workspace")
+TOOLS_DIR = WORKSPACE_DIR / "tools"
 
 # Кеш: имя_тула -> {"mtime": float, "manifest": dict}
 _REGISTRY = {}
 _REGISTRY_LOADED = False
+
+# Кеш состояний: (абс.путь_state_file) -> {"mtime": float, "lines": list[str]}
+_STATE_CACHE = {}
+
+# Дефолт для лимита строк состояния, если не задан в манифесте
+_STATE_DEFAULT_LIMIT = 8
 
 # Встроенные тулы — только описание для каталога; исполнение в _tool_loop
 BUILTIN_TOOLS = {
@@ -72,21 +80,71 @@ _CALL_RE = re.compile(r'^\s*([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\s*\((.*)\)\s*$', 
 
 
 def _extract_manifest(text: str):
-    """Вытаскивает литеральный dict TOOL из исходника через AST."""
+    """Вытаскивает литеральный dict TOOL из исходника через AST.
+
+    Модель часто выносит значения в переменные (STATE_FILE = "...").
+    Чтобы не ломаться на этом, собираем верхнеуровневые простые константы
+    (NAME = 'str' | int | float | bool | list | dict из литералов) и при
+    разборе TOOL подставляем их как значения."""
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return None
+
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    try:
+                        consts[target.id] = ast.literal_eval(node.value)
+                    except (ValueError, TypeError):
+                        pass
+
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "TOOL":
-                    try:
-                        val = ast.literal_eval(node.value)
-                    except (ValueError, TypeError):
-                        return None
+                    val = _eval_with_consts(node.value, consts)
                     if isinstance(val, dict) and val.get("name") and isinstance(val.get("methods"), dict):
                         return val
+    return None
+
+
+def _eval_with_consts(node, consts):
+    """Рекурсивный разбор литерала с подстановкой имён из consts."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return consts.get(node.id)
+    if isinstance(node, ast.Str):  # py<3.8 совместимость
+        return node.s
+    if isinstance(node, ast.Num):
+        return node.n
+    if isinstance(node, ast.List):
+        return [_eval_with_consts(e, consts) for e in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(_eval_with_consts(e, consts) for e in node.elts)
+    if isinstance(node, ast.Set):
+        return {_eval_with_consts(e, consts) for e in node.elts}
+    if isinstance(node, ast.Dict):
+        d = {}
+        for k, v in zip(node.keys, node.values):
+            key = _eval_with_consts(k, consts)
+            if key is not None:
+                d[key] = _eval_with_consts(v, consts)
+        return d
+    if isinstance(node, (ast.UnaryOp,)) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = _eval_with_consts(node.operand, consts)
+        if isinstance(operand, (int, float)):
+            return -operand if isinstance(node.op, ast.USub) else operand
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_with_consts(node.left, consts)
+        right = _eval_with_consts(node.right, consts)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left + right
     return None
 
 
@@ -140,8 +198,77 @@ def get_custom_tools():
     return {n: info["manifest"] for n, info in reg.items()}
 
 
+def _read_state(manifest: dict):
+    """Читает state_file тула -> dict(title, lines, limit) или None.
+
+    Тул сам готовит строки для показа (`lines`) и пишет их в state_file.
+    Реестр ничего не интерпретирует — только показывает готовые строки.
+    Кеш по mtime файла состояния: перечитываем только когда тул его поменял.
+    """
+    state = manifest.get("state")
+    if not state or not isinstance(state, dict):
+        return None
+    rel = state.get("file")
+    if not rel:
+        return None
+    path = (WORKSPACE_DIR / rel).resolve()
+    # Безопасность: состояние может лежать только внутри workspace
+    try:
+        path.relative_to(WORKSPACE_DIR.resolve())
+    except ValueError:
+        logger.warning("state_file вне workspace: %s", path)
+        return None
+    if not path.exists():
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+
+    cached = _STATE_CACHE.get(str(path))
+    if cached and cached["mtime"] == mtime:
+        lines = cached["lines"]
+    else:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        lines = data.get("lines") if isinstance(data, dict) else None
+        if not isinstance(lines, list):
+            return None
+        lines = [str(x) for x in lines]
+        _STATE_CACHE[str(path)] = {"mtime": mtime, "lines": lines}
+
+    return {
+        "title": state.get("title") or f"{manifest.get('name', 'тул')}",
+        "lines": lines,
+        "limit": int(state.get("limit") or _STATE_DEFAULT_LIMIT),
+    }
+
+
+def _state_block(manifest: dict) -> str:
+    """Блок <STATE:title>...</STATE> для промпта из state_file тула."""
+    st = _read_state(manifest)
+    if not st:
+        return ""
+    lines = st["lines"]
+    limit = max(1, st["limit"])
+    shown = lines[:limit]
+    out = [f"<STATE:{st['title']}>"]
+    out.extend(shown)
+    rest = len(lines) - len(shown)
+    if rest > 0:
+        view = manifest.get("state", {}).get("view")
+        if view:
+            out.append(f"(+{rest} ещё — полное состояние через {manifest['name']}.{view})")
+        else:
+            out.append(f"(+{rest} ещё — не показано)")
+    out.append("</STATE>")
+    return "\n".join(out)
+
+
 def build_tools_block() -> str:
-    """Лаконичный блок <TOOLS> для промпта. Пересобирается при изменении реестра."""
+    """Блок <TOOLS> + блоки <STATE> состояниев для промпта."""
     tools = list(BUILTIN_TOOLS.values()) + list(get_custom_tools().values())
     if not tools:
         return ""
@@ -163,6 +290,12 @@ def build_tools_block() -> str:
             sig = f"{t['name']}.{mname}({', '.join(params)})"
             lines.append(f"    {sig} — {m.get('description', '').strip()}")
     lines.append("</TOOLS>")
+
+    for manifest in get_custom_tools().values():
+        st = _state_block(manifest)
+        if st:
+            lines.append("")
+            lines.append(st)
     return "\n".join(lines)
 
 
@@ -226,11 +359,41 @@ def _split_top_level(s: str) -> list:
     return parts
 
 
+_ESCAPE_MAP = {
+    "n": "\n", "t": "\t", "r": "\r",
+    "\\": "\\", "'": "'", '"': '"', "0": "\0",
+}
+
+
+def _unescape_literals(s: str) -> str:
+    """Раскрывает escape-последовательности внутри строкового аргумента tool_call.
+
+    Модель копирует фрагменты из вывода file.read, где настоящие переносы строк
+    показаны JSON-экранированием ('\n' — два символа). Без раскрытия edit/write
+    не находили old и портили файлы, записывая литеральный backslash-n."""
+    if "\\" not in s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt in _ESCAPE_MAP:
+                out.append(_ESCAPE_MAP[nxt])
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _parse_value(v: str):
     if not v:
         return ""
     if (v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'"):
-        return v[1:-1]
+        return _unescape_literals(v[1:-1])
     if v.lower() in ("true", "false", "null", "none"):
         return {"true": True, "false": False, "null": None, "none": None}[v.lower()]
     try:

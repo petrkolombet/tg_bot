@@ -47,10 +47,19 @@ def _flatten_replies(replies):
     walk(replies)
     return out
 
+# Дедуп сообщений: chat_id -> текст последнего ОТПРАВЛЕННОГО сообщения.
+# Если новое сообщение дословно совпадает с последним — не шлём (модель
+# склонна повторять собственные фразы из истории).
+_last_sent_text: dict = {}
+
+
 async def _send_md(update_or_ctx, chat_id, text, reply_to_message_id=None):
-    """Отправка сообщения с рендером Markdown. Если Markdown невалиден
-    (Telegram бросит Bad Request) — отправляем чистым текстом без parse_mode,
-    чтобы сообщение всегда дошло."""
+    """Отправка с рендером Markdown + дедуп. Если текст дословно равен последнему
+    отправленному в этот чат — пропускаем (False). Если Markdown невалиден
+    (Telegram бросит Bad Request) — отправляем чистым текстом без parse_mode."""
+    if text and text == _last_sent_text.get(chat_id):
+        logger.info(f"⏭️ [DEDUP] Пропускаю дубль сообщения: {text[:80]}")
+        return False
     try:
         await update_or_ctx.bot.send_message(
             chat_id=chat_id,
@@ -65,6 +74,37 @@ async def _send_md(update_or_ctx, chat_id, text, reply_to_message_id=None):
             text=text,
             reply_to_message_id=reply_to_message_id,
         )
+    _last_sent_text[chat_id] = text
+    logger.info(f"💡<- {text}")
+    return True
+
+
+async def _send_acks(update, context, state_manager, ack_replies, reply_to_message_id=None):
+    """Отправка ВСЕХ ack-реплик, пришедших вместе с tool_call/командой/поиском.
+
+    Поведение как у финального ответа в handle_message:
+      - каждая реплика проходит дедуп (дословный повтор последнего не шлём);
+      - реально отправленное логируется '💡<-' и пишется в историю (никаких
+        фантомов в истории и логах);
+      - между репликами пауза с типингом, как в обычном ответе.
+    Возвращает количество отправленных сообщений."""
+    chat_id = update.effective_user.id
+    reply_id = reply_to_message_id or getattr(update.message, "message_id", None)
+    flat = _flatten_replies(ack_replies)
+    sent_n = 0
+    for i, ack_text in enumerate(flat):
+        if not ack_text:
+            continue
+        sent = await _send_md(context, chat_id, ack_text, reply_to_message_id=reply_id)
+        if not sent:
+            continue
+        await state_manager.add_history("model", ack_text)
+        asyncio.create_task(insert_to_rag(f"Бот: {ack_text}", metadata=f"bot_{chat_id}"))
+        sent_n += 1
+        if i < len(flat) - 1:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(min(1.0 + len(flat[i + 1]) * 0.06, 3.0))
+    return sent_n
 
 async def _handle_alarm_action(alarm_data, state_manager):
     """Выполняет add_alarm action (add/remove/edit).
@@ -182,7 +222,8 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             forced = (
                 f"⚠️ Ты выполнил уже {config.MAX_TOOLS_TURN} инструментов подряд (команды/поиск/воспоминания). "
                 "Хватит — ответь пользователю обычным текстом, используя последние результаты. "
-                "Новых инструментов не запускай."
+                "Новых инструментов не запускай. НЕ ДУБЛИРУЙ: не повторяй дословно сообщения, "
+                "которые уже видишь в истории. Напиши новый ответ."
             )
             decision = await process_user_input(
                 user_text, state_manager, memory_context=forced
@@ -219,9 +260,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
 
             ack_replies = _flatten_replies(decision.get("replies"))
             if ack_replies:
-                ack_text = ack_replies[0]
-                await update.message.reply_text(ack_text)
-                await state_manager.add_history("model", ack_text)
+                await _send_acks(update, context, state_manager, ack_replies)
 
             # Встроенные тулы → диспатч на существующие поля и повторный проход цикла
             if tool_name in tools_registry.BUILTIN_NAMES:
@@ -244,16 +283,16 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             manifest = tools_registry.get_tool_manifest(tool_name)
             script_path = manifest.get("file")
             method_schema = manifest["methods"][method]
-            cli_args = tools_registry.build_cli_args(method_schema, kwargs)
-            result = await server_access.execute_custom_tool(script_path, [method] + cli_args, timeout=60)
+            result = await server_access.execute_custom_tool(script_path, method, kwargs=kwargs, timeout=60)
             output = result.get("output", "")
             error = result.get("error", "")
-            logger.info(f"🔧 [TOOL] {call_str} → output={len(output)} симв, error={len(error)} симв")
 
             if result.get("allowed", True) is False:
                 out_block = error or "🚫 Выполнение тула запрещено"
             else:
                 out_block = output
+
+            logger.info(f"✅🔧 [RESULT] {out_block}")
 
             if len(out_block) <= config.TOOL_RESULT_LIMIT:
                 report = out_block
@@ -274,15 +313,12 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
 
             ack_replies = _flatten_replies(decision.get("replies"))
             if ack_replies:
-                ack_text = ack_replies[0]
-                await update.message.reply_text(ack_text)
-                await state_manager.add_history("model", ack_text)
+                await _send_acks(update, context, state_manager, ack_replies)
 
             logger.info(f"🖥️ [SERVER] Команда: {server_cmd} ({server_desc})")
             result = await server_access.execute(server_cmd, timeout=30)
             output = result.get("output", "")
             error = result.get("error", "")
-            logger.info(f"🖥️ [SERVER] output={len(output)} символов")
             server_context = f"Результат выполнения команды '{server_cmd}':\n---\n{output}\n---"
             if error:
                 server_context += f"\nОшибки:\n{error}"
@@ -291,6 +327,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                 report = output
             else:
                 report = await summarize_tool_output(server_cmd, server_desc, output, state_manager)
+            logger.info(f"🖥️ [SERVER] ✅ {server_cmd} → {report}")
             rec = f'⚙️ выполнил: {server_cmd} → {report}'
             await state_manager.add_tool_record(rec)
 
@@ -302,9 +339,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             search_query = decision["google_search"]
             ack_replies = _flatten_replies(decision.get("replies"))
             if ack_replies:
-                ack_text = ack_replies[0]
-                await update.message.reply_text(ack_text)
-                await state_manager.add_history("model", ack_text)
+                await _send_acks(update, context, state_manager, ack_replies)
             logger.info(f"🔍 [SEARCH] Запрос к поиску: {search_query}")
             search_result = await search_web(search_query)
             if search_result:
@@ -329,18 +364,14 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             memory_topic = decision["memory_query_topic"]
             ack_replies = _flatten_replies(decision.get("replies"))
             if ack_replies:
-                ack_text = ack_replies[0]
-                await update.message.reply_text(ack_text)
-                await state_manager.add_history("model", ack_text)
+                await _send_acks(update, context, state_manager, ack_replies)
             decision = await retrieve_memory(user_text, memory_topic, state_manager)
 
         elif decision.get("add_alarm"):
             alarm_data = decision["add_alarm"]
             ack_replies = _flatten_replies(decision.get("replies"))
             if ack_replies:
-                ack_text = ack_replies[0]
-                await update.message.reply_text(ack_text)
-                await state_manager.add_history("model", ack_text)
+                await _send_acks(update, context, state_manager, ack_replies)
             logger.info(f"⏰ [ALARM] Действие: {alarm_data}")
             alarm_context, alarm_record, ok = await _handle_alarm_action(alarm_data, state_manager)
             await state_manager.add_tool_record(alarm_record)
@@ -411,16 +442,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 replies = [single_text]
                 
         if replies:
+            sent_count = 0
             for i, message_text in enumerate(replies):
-                logger.info(f"💡<- {message_text}")
+                sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+                if not sent:
+                    continue
                 await state_manager.add_history("model", message_text)
                 asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
-                
-                await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+                sent_count += 1
                 if i < len(replies) - 1:
                     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
                     next_len = len(replies[i+1])
                     await asyncio.sleep(min(1.0 + next_len * 0.06, 3.0))
+            if not sent_count:
+                logger.info("💡<- [все реплики продублированы дедупом]")
         else:
             logger.info("💡<- [молчание]")
     finally:
@@ -490,15 +525,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         replies = _flatten_replies(decision.get("replies"))
         if replies:
+            sent_count = 0
             for i, message_text in enumerate(replies):
-                logger.info(f"💡<- {message_text}")
+                sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+                if not sent:
+                    continue
                 await state_manager.add_history("model", message_text)
                 asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
-                await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+                sent_count += 1
                 if i < len(replies) - 1:
                     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
                     next_len = len(replies[i+1])
                     await asyncio.sleep(min(1.0 + next_len * 0.06, 3.0))
+            if not sent_count:
+                logger.info("💡<- [все реплики продублированы дедупом]")
         else:
             logger.info("💡<- [молчание]")
     finally:

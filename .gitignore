@@ -1,5 +1,7 @@
 .env
 *.env
+.env.bak*
+*.bak
 __pycache__/
 *.pyc
 state.json
@@ -7,3 +9,4 @@ state.json
 .venv/
 venv/
 workspace/
+rag_storage/

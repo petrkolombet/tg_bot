@@ -10,10 +10,11 @@ import subprocess
 import asyncio
 import logging
 import re
+import json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-logger = logging.getLogger("bot_ai")
+logger = logging.getLogger(__name__)
 
 WORKSPACE = Path("/root/tg_bot/workspace")
 LOG_FILE = "/root/tg_bot/server_access.log"
@@ -268,13 +269,13 @@ def _sandbox_prefix(entry: str, *extra) -> list:
     ]
 
 
-async def execute_custom_tool(script_path: str, args: list, timeout: int = 60) -> dict:
-    """Выполняет кастомный тул (отдельный python-скрипт из workspace/tools)
-    внутри того же sandbox, что и обычные команды.
+async def execute_custom_tool(script_path: str, method: str, kwargs: dict = None, timeout: int = 60) -> dict:
+    """Выполняет кастомный тул (файл из workspace/tools) через универсальный runner.
 
-    script_path — путь к файлу тула (проверяется, что внутри workspace/tools).
-    args — список аргументов CLI: ['get_unread', '--limit', '5'].
-    """
+    script_path — путь к .py тула (обязан лежать в workspace/tools).
+    method — имя метода-функции в файле; kwargs — аргументы вызова.
+    Модели не нужно писать _main/argparse: runner сам импортирует файл,
+    вызывает метод и печатает JSON результата."""
     tool_dir = (WORKSPACE / "tools").resolve()
     script = Path(script_path).resolve()
     # Хард-гарантия: скрипт обязан лежать в workspace/tools
@@ -286,10 +287,13 @@ async def execute_custom_tool(script_path: str, args: list, timeout: int = 60) -
             "error": f"🚫 Тул вне workspace/tools: {script_path}"
         }
 
-    cmd = [str(script)] + args
+    kwargs = kwargs or {}
+    runner = Path(__file__).resolve().parent / "_tool_runner.py"
+    cmd = [str(runner), str(script), method]
+    stdin_data = json.dumps(kwargs, ensure_ascii=False)
 
     ts = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"{ts} | mode=tool | allowed=True | cmd=python3 {script.name} {' '.join(args[:20])}\n"
+    log_entry = f"{ts} | mode=tool | allowed=True | cmd={script.name}.{method}({json.dumps(kwargs, ensure_ascii=False)[:80]})\n"
     try:
         with open(LOG_FILE, "a") as f:
             f.write(log_entry)
@@ -300,13 +304,14 @@ async def execute_custom_tool(script_path: str, args: list, timeout: int = 60) -
         proc = await asyncio.create_subprocess_exec(
             *_sandbox_prefix("python3"),
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=WORKSPACE,
             env={**os.environ, "LANG": "C", "TERM": "dumb", "HOME": str(WORKSPACE)},
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
+            proc.communicate(stdin_data.encode("utf-8")), timeout=timeout
         )
         output = stdout.decode("utf-8", errors="replace").strip()
         err_output = stderr.decode("utf-8", errors="replace").strip()
