@@ -22,6 +22,47 @@ def render_role(role):
         return "tool"
     return "user" if role == "user" else "assistant"
 
+def _g4f_urlopen(req, timeout=180):
+    """Открывает URL через прокси, указанный в G4F_PROXY (для g4f.space),
+    чтобы кредиты совпадали с IP бейкера. Если прокси не задан — системный."""
+    if config.G4F_PROXY:
+        proxy_handler = urllib.request.ProxyHandler({
+            "http": config.G4F_PROXY,
+            "https": config.G4F_PROXY,
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+async def safe_generate_content_g4f(prompt, temperature=0.85):
+    """Фолбек-генерация через g4f.space (чужие аккаунты, PoW-кредиты).
+    Модель gemini-3.5-flash. Ретраи при 429/сбоях. Возвращает текст или None."""
+    payload = json.dumps({
+        "model": config.G4F_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }).encode('utf-8')
+    url = f"{config.G4F_URL}/chat/completions"
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(req))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"]
+            return text
+        except Exception as e:
+            logger.error(f"❌ [G4F] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(3)
+    return None
+
 async def safe_generate_content(prompt, temperature=0.85):
     payload = json.dumps({
         "model": config.GEMINI_MODEL,
@@ -49,7 +90,8 @@ async def safe_generate_content(prompt, temperature=0.85):
             logger.error(f"❌ [GEMINI] Ошибка (попытка {attempt+1}): {e}")
             if attempt < 2:
                 await asyncio.sleep(2)
-    return None
+    logger.warning("⚠️ [GEMINI] 3 попытки провалились — пробую g4f.space фолбек")
+    return await safe_generate_content_g4f(prompt, temperature)
 
 async def safe_generate_deepseek(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_deepseek"):
     """Генерация через DeepSeek-прокси (OpenAI-совместимый). Модель/прокси берутся

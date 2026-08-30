@@ -23,6 +23,12 @@ GEMINI_PROXY_URL = os.getenv('GEMINI_PROXY_URL', 'http://127.0.0.1:4984')
 GEMINI_PROXY_KEY = os.getenv('GEMINI_PROXY_KEY', 'sk-gemini')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.6-flash')
 
+# --- Gemini фолбек (g4f.space, чужие аккаунты + PoW-кредиты) ---
+# Кредиты привязаны к IP прокси (бейкер tg-cake-baker печёт через него же).
+G4F_URL = os.getenv('G4F_URL', 'https://g4f.space/api/gemini')
+G4F_MODEL = os.getenv('G4F_MODEL', 'models/gemini-3.5-flash')
+G4F_PROXY = os.getenv('G4F_PROXY', '')  # если пусто — системный https_proxy
+
 # --- DeepSeek (ТОЛЬКО агентный поиск) ---
 DEEPSEEK_PROXY_URL = os.getenv('DEEPSEEK_PROXY_URL', 'http://127.0.0.1:9655')
 DEEPSEEK_PROXY_KEY = os.getenv('DEEPSEEK_PROXY_KEY', 'sk-freedeepseek')
