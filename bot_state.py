@@ -280,6 +280,10 @@ class StateManager:
             # Генерация уникального ID
             self.state["background_thoughts"].append({"id": os.urandom(4).hex(), "text": thought})
             logger.info(f"💡 [REFLECTION] Сгенерирована новая мысль: {thought}")
+        # Ротация: храним только последние MAX_BACKGROUND_THOUGHTS
+        max_n = config.MAX_BACKGROUND_THOUGHTS
+        if len(self.state["background_thoughts"]) > max_n:
+            self.state["background_thoughts"] = self.state["background_thoughts"][-max_n:]
         self.state["last_reflection_time"] = datetime.datetime.now(timezone.utc).timestamp()
         await self.save()
 

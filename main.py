@@ -7,7 +7,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, fil
 import config
 from bot_state import StateManager
 import bot_ai
-from bot_handlers import handle_message, handle_voice, handle_server, background_tasks
+from bot_handlers import handle_message, handle_voice, handle_server, handle_sum, handle_think, background_tasks
 
 # Настройка логирования
 logging.basicConfig(
@@ -56,6 +56,8 @@ def main():
     app.bot_data["update_longterm_summary"] = bot_ai.update_longterm_summary
 
     app.add_handler(CommandHandler("server", handle_server))
+    app.add_handler(CommandHandler("sum", handle_sum))
+    app.add_handler(CommandHandler("think", handle_think))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     

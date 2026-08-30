@@ -12,6 +12,7 @@ from telegram.ext import ContextTypes
 import config
 from rag import insert_to_rag
 import server_access
+import tools_registry
 from bot_ai import summarize_tool_output, summarize_search_result
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,25 @@ def _flatten_replies(replies):
                 out.append(s)
     walk(replies)
     return out
+
+async def _send_md(update_or_ctx, chat_id, text, reply_to_message_id=None):
+    """Отправка сообщения с рендером Markdown. Если Markdown невалиден
+    (Telegram бросит Bad Request) — отправляем чистым текстом без parse_mode,
+    чтобы сообщение всегда дошло."""
+    try:
+        await update_or_ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_to_message_id=reply_to_message_id,
+        )
+    except Exception:
+        logger.warning("⚠️ [SEND] Markdown битый, отправляю plain text")
+        await update_or_ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+        )
 
 async def _handle_alarm_action(alarm_data, state_manager):
     """Выполняет add_alarm action (add/remove/edit).
@@ -125,10 +145,12 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
         return (
             d and isinstance(d, dict)
             and (d.get("server_command") or d.get("google_search") or d.get("memory_query_topic")
-                 or d.get("add_alarm"))
+                 or d.get("add_alarm") or d.get("tool_call"))
         )
 
     def tool_key(d):
+        if d.get("tool_call"):
+            return ("tool", d["tool_call"])
         if d.get("server_command"):
             s = d["server_command"]
             cmd = s.get("cmd") if isinstance(s, dict) else s
@@ -181,7 +203,71 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
 
         last_key = cur_key
 
-        if decision.get("server_command"):
+        if decision.get("tool_call"):
+            call_str = decision["tool_call"]
+            try:
+                tool_name, method, kwargs = tools_registry.parse_tool_call(call_str)
+            except ValueError as e:
+                logger.warning(f"⚠️ [TOOLS] Плохой tool_call: {e}")
+                bad = (
+                    f"⚠️ tool_call '{call_str}' не распознан: {e}. "
+                    "Проверь имя инструмента, метод и обязательные аргументы по каталогу. "
+                    "Либо ответь пользователю текстом, либо исправь вызов."
+                )
+                decision = await process_user_input(user_text, state_manager, memory_context=bad)
+                continue
+
+            ack_replies = _flatten_replies(decision.get("replies"))
+            if ack_replies:
+                ack_text = ack_replies[0]
+                await update.message.reply_text(ack_text)
+                await state_manager.add_history("model", ack_text)
+
+            # Встроенные тулы → диспатч на существующие поля и повторный проход цикла
+            if tool_name in tools_registry.BUILTIN_NAMES:
+                if tool_name == "shell" and method == "run":
+                    decision = {"server_command": {"cmd": kwargs.get("cmd", ""), "desc": kwargs.get("desc", "")}}
+                elif tool_name == "search" and method == "run":
+                    decision = {"google_search": kwargs.get("query", "")}
+                elif tool_name == "memory" and method == "query":
+                    decision = {"memory_query_topic": kwargs.get("topic", "")}
+                else:
+                    logger.warning(f"⚠️ [TOOLS] Неизвестный встроенный метод {tool_name}.{method}")
+                    decision = await process_user_input(
+                        user_text, state_manager,
+                        memory_context=f"⚠️ Инструмент '{tool_name}.{method}' неизвестен. Используй методы из каталога.",
+                    )
+                continue
+
+            # Кастомный тул из workspace/tools
+            logger.info(f"🔧 [TOOL] {call_str}")
+            manifest = tools_registry.get_tool_manifest(tool_name)
+            script_path = manifest.get("file")
+            method_schema = manifest["methods"][method]
+            cli_args = tools_registry.build_cli_args(method_schema, kwargs)
+            result = await server_access.execute_custom_tool(script_path, [method] + cli_args, timeout=60)
+            output = result.get("output", "")
+            error = result.get("error", "")
+            logger.info(f"🔧 [TOOL] {call_str} → output={len(output)} симв, error={len(error)} симв")
+
+            if result.get("allowed", True) is False:
+                out_block = error or "🚫 Выполнение тула запрещено"
+            else:
+                out_block = output
+
+            if len(out_block) <= config.TOOL_RESULT_LIMIT:
+                report = out_block
+            else:
+                report = await summarize_tool_output(call_str, method_schema.get("description", ""), out_block, state_manager)
+            rec = f'🔧 вызвал: {call_str} → {report}'
+            await state_manager.add_tool_record(rec)
+
+            tool_context = f"Результат вызова тула '{call_str}':\n---\n{out_block}\n---"
+            if error:
+                tool_context += f"\nОшибки stderr:\n{error}"
+            decision = await process_user_input(user_text, state_manager, memory_context=tool_context)
+
+        elif decision.get("server_command"):
             server_spec = decision["server_command"]
             server_cmd = server_spec.get("cmd") if isinstance(server_spec, dict) else server_spec
             server_desc = server_spec.get("desc", "") if isinstance(server_spec, dict) else ""
@@ -330,7 +416,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await state_manager.add_history("model", message_text)
                 asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
                 
-                await update.message.reply_text(message_text)
+                await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                 if i < len(replies) - 1:
                     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
                     next_len = len(replies[i+1])
@@ -408,7 +494,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"💡<- {message_text}")
                 await state_manager.add_history("model", message_text)
                 asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
-                await update.message.reply_text(message_text)
+                await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                 if i < len(replies) - 1:
                     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
                     next_len = len(replies[i+1])
@@ -468,7 +554,7 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
             if replies:
                 for text_to_send in replies:
                     if text_to_send:
-                        await context.bot.send_message(chat_id=config.ALLOWED_USER_ID, text=text_to_send)
+                        await _send_md(context, config.ALLOWED_USER_ID, text_to_send)
                         await state_manager.add_history("model", text_to_send)
                         await asyncio.sleep(random.uniform(1.5, 3.0))
                 await state_manager.remove_alarm(alarm["id"])
@@ -501,7 +587,7 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
                 for msg in replies:
                     text_to_send = msg if isinstance(msg, str) else msg.get("text", "")
                     if text_to_send:
-                        await context.bot.send_message(chat_id=config.ALLOWED_USER_ID, text=text_to_send)
+                        await _send_md(context, config.ALLOWED_USER_ID, text_to_send)
                         await state_manager.add_history("model", text_to_send)
                         await asyncio.sleep(random.uniform(1.5, 3.0))
             logger.info(f"🤔 [INTEREST] Попытка завершена ({len(replies)} сообщений), фиксирую кулдаун.")
@@ -550,3 +636,37 @@ async def handle_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = response[:4000] + "\n... (обрезано)"
 
     await update.message.reply_text(response, parse_mode="Markdown")
+
+async def handle_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск обновления саммари: /sum"""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+    state_manager = context.bot_data["state_manager"]
+    update_longterm_summary = context.bot_data["update_longterm_summary"]
+    await update.message.reply_text("🔄 обновляю саммари...")
+    try:
+        await update_longterm_summary(state_manager)
+        summary = state_manager.state.get("summary", "(пусто)")
+        await update.message.reply_text(f"✅ саммари обновлено:\n{summary}")
+    except Exception as e:
+        logger.error("💥 [SUM] Ошибка обновления саммари!", exc_info=True)
+        await update.message.reply_text(f"❌ ошибка: {e}")
+
+async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск генерации мыслей (рефлексии): /think"""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+    state_manager = context.bot_data["state_manager"]
+    generate_reflection = context.bot_data["generate_reflection"]
+    await update.message.reply_text("💭 запускаю рефлексию...")
+    try:
+        thoughts = await generate_reflection(state_manager)
+        if not thoughts:
+            await update.message.reply_text("💭 рефлексия не дала новых мыслей (мало истории или уже актуально)")
+            return
+        await state_manager.add_thoughts(thoughts)
+        text = "💭 новые мысли:\n" + "\n".join(f"- {t}" for t in thoughts)
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error("💥 [THINK] Ошибка рефлексии!", exc_info=True)
+        await update.message.reply_text(f"❌ ошибка: {e}")

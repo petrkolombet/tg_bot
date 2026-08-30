@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import config
 from rag import insert_to_rag, query_rag
+import tools_registry
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,42 @@ async def safe_generate_content(prompt, temperature=0.85):
             return text
         except Exception as e:
             logger.error(f"❌ [GEMINI] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    return None
+
+async def safe_generate_deepseek(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_deepseek"):
+    """Генерация через DeepSeek-прокси (OpenAI-совместимый). Модель/прокси берутся
+    из конфига; для рефлексии можно указать свои. Возвращает текст или None."""
+    model = model or config.DEEPSEEK_MODEL
+    proxy_url = proxy_url or config.DEEPSEEK_PROXY_URL
+    proxy_key = proxy_key or config.DEEPSEEK_PROXY_KEY
+    logger.info(f"📤 [DEEPSEEK:{model}] Отправка промпта длиной: {len(prompt)} символов")
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        f"{proxy_url}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {proxy_key}"
+        }
+    )
+
+    for attempt in range(3):
+        try:
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=180))
+            data = json.loads(resp.read().decode('utf-8'))
+            text = data["choices"][0]["message"]["content"]
+            logger.info(f"📤 [DEEPSEEK:{model}] Ответ получен, длина: {len(text)} символов")
+            return text
+        except Exception as e:
+            logger.error(f"❌ [DEEPSEEK:{model}] Ошибка (попытка {attempt+1}): {e}")
             if attempt < 2:
                 await asyncio.sleep(2)
     return None
@@ -386,10 +423,14 @@ async def generate_reflection(state_manager):
     older_context_start_index = max(0, older_context_end_index - 200)
     older_context = reflection_history[older_context_start_index:older_context_end_index]
     older_context_text = "\n".join([f"{render_role(m['role'])}: {m['content']}" for m in older_context])
+
+    existing_thoughts_text = ""
+    if state_manager.state["background_thoughts"]:
+        existing_thoughts_text = "\n".join([f'- {t["text"]}' for t in state_manager.state["background_thoughts"]])
     
-    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — свой внутренний монолог. Прочитай свой недавний и старый диалог с ползователем и создай 1-2 мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям и глубоким. Замечай то, чего не говорили, но чувствовали. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговлра. О чем то радуешься, беспокоишься, привыкаешь, злишся, обижаешься? Пример(не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, твои мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злосью или чем-то совершенно другим или смешанным. Описывай мысли максимально чуственно, используй прилагательные и слова которые точно описывают твои мысли. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
+    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — свой внутренний монолог. Прочитай свой недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям и глубоким. Замечай то, чего не говорили, но чувствовали. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговлра. О чем то радуешься, беспокоишься, привыкаешь, злишся, обижаешься? Пример(не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, твои мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злосью или чем-то совершенно другим или смешанным. Описывай мысли максимально чуственно, используй прилагательные и слова которые точно описывают твои мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
-    raw_text = await safe_generate_content(prompt, temperature=0.7)
+    raw_text = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.REFLECTION_PROXY_URL, proxy_key=config.REFLECTION_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection")
     parsed = await try_parse_or_repair_json(raw_text)
     return parsed.get("thoughts", []) if parsed else []
 
@@ -449,7 +490,9 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         lines = [f"- [💬] {t['text']} [id:{t['id']}]" for t in interests]
         if lines:
             interests_block = "💬 Темы, которые ты хотел поднять/сделать. Используй, когда это уместно по ходу разговора.\n" + "\n".join(lines)
-        
+
+    tools_block = tools_registry.build_tools_block()
+
     prompt = prompt_template.format(
         memory_context_block=memory_context_block, 
         system_alert=system_alert, 
@@ -458,6 +501,7 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         thoughts_block=thoughts_block, 
         alarms_block=alarms_block,
         interests_block=interests_block,
+        tools_block=tools_block,
         history=history,
         summary_block=summary_block,
         task_execution_block=task_execution_block, # Вставляем блок выполнения задачи

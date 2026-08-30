@@ -23,18 +23,28 @@ GEMINI_PROXY_URL = os.getenv('GEMINI_PROXY_URL', 'http://127.0.0.1:4984')
 GEMINI_PROXY_KEY = os.getenv('GEMINI_PROXY_KEY', 'sk-gemini')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.6-flash')
 
-# --- DeepSeek (для поиска) ---
+# --- DeepSeek (саммари, выжимки тулов/поиска) ---
 DEEPSEEK_PROXY_URL = os.getenv('DEEPSEEK_PROXY_URL', 'http://127.0.0.1:9655')
 DEEPSEEK_PROXY_KEY = os.getenv('DEEPSEEK_PROXY_KEY', 'sk-freedeepseek')
 DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
 
+# --- DeepSeek (рефлексия / фоновые мысли) ---
+REFLECTION_PROXY_URL = os.getenv('REFLECTION_PROXY_URL', 'http://127.0.0.1:9655')
+REFLECTION_PROXY_KEY = os.getenv('REFLECTION_PROXY_KEY', 'sk-freedeepseek')
+REFLECTION_MODEL = os.getenv('REFLECTION_MODEL', 'deepseek-reasoner')
+REFLECTION_TEMPERATURE = float(os.getenv('REFLECTION_TEMPERATURE', '0.7'))
+
 # --- Groq (для транскрипции голосовых) ---
 GROQ_KEYS = []
-try:
-    with open('/root/ai-chat/.groq_keys') as f:
-        GROQ_KEYS = [line.strip() for line in f if line.strip()]
-except FileNotFoundError:
-    pass
+_env_groq = os.getenv('GROQ_KEYS', '')
+if _env_groq:
+    GROQ_KEYS = [k.strip() for k in _env_groq.split(',') if k.strip()]
+if not GROQ_KEYS:
+    try:
+        with open('/root/ai-chat/.groq_keys') as f:
+            GROQ_KEYS = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        pass
 
 # --- Имена файлов ---
 STATE_FILE = "state.json"
@@ -45,6 +55,7 @@ CHECK_INTERVAL_SECONDS = 60
 REFLECTION_INTERVAL_HOURS = 1
 SILENCE_BEFORE_REFLECTION_HOURS = 0.15
 SILENCE_BEFORE_PROACTIVE_MINUTES = 30
+MAX_BACKGROUND_THOUGHTS = 6  # ротация фоновых мыслей: оставляем только последние N
 
 # --- Будильники и темы ---
 ALARM_MAX_MISSES = 2

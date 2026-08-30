@@ -195,28 +195,7 @@ async def execute(cmd: str, timeout: int = 30) -> dict:
             "error": f"🚫 Запрещено: {reason}"
         }
 
-    sandbox_prefix = [
-        "bwrap", "--unshare-ipc",
-        "--ro-bind", "/usr", "/usr",
-        "--ro-bind", "/lib", "/lib",
-        "--ro-bind", "/lib64", "/lib64",
-        "--ro-bind", "/bin", "/bin",
-        "--ro-bind", "/sbin", "/sbin",
-        "--ro-bind", "/etc", "/etc",
-        "--ro-bind", "/run", "/run",
-        "--ro-bind", "/var", "/var",
-        "--ro-bind", "/root", "/root",
-        "--proc", "/proc",
-        "--dev", "/dev",
-        "--tmpfs", "/tmp",
-        "--setenv", "SYSTEMD_IGNORE_CHROOT", "1",
-        "--setenv", "HOME", str(WORKSPACE),
-        "--chdir", str(WORKSPACE),
-        "--dir", str(WORKSPACE),
-        "--bind", str(WORKSPACE), str(WORKSPACE),
-        "/bin/bash", "-c",
-    ]
-
+    sandbox_prefix = _sandbox_prefix("bash", "-c")
     try:
         proc = await asyncio.create_subprocess_exec(
             *sandbox_prefix,
@@ -257,6 +236,104 @@ async def execute(cmd: str, timeout: int = 30) -> dict:
         return {
             "allowed": True,
             "mode": mode,
+            "output": "",
+            "error": f"❌ Ошибка: {e}"
+        }
+
+
+def _sandbox_prefix(entry: str, *extra) -> list:
+    """Общий bwrap-префикс. entry — исполняемая программа внутри sandbox
+    ('bash' — интерактивная команда через -c, 'python3' — тул-скрипт).
+    extra — доп. аргументы после entry (например '-c')."""
+    return [
+        "bwrap", "--unshare-ipc",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind", "/run", "/run",
+        "--ro-bind", "/var", "/var",
+        "--ro-bind", "/root", "/root",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--setenv", "SYSTEMD_IGNORE_CHROOT", "1",
+        "--setenv", "HOME", str(WORKSPACE),
+        "--chdir", str(WORKSPACE),
+        "--dir", str(WORKSPACE),
+        "--bind", str(WORKSPACE), str(WORKSPACE),
+        entry, *extra,
+    ]
+
+
+async def execute_custom_tool(script_path: str, args: list, timeout: int = 60) -> dict:
+    """Выполняет кастомный тул (отдельный python-скрипт из workspace/tools)
+    внутри того же sandbox, что и обычные команды.
+
+    script_path — путь к файлу тула (проверяется, что внутри workspace/tools).
+    args — список аргументов CLI: ['get_unread', '--limit', '5'].
+    """
+    tool_dir = (WORKSPACE / "tools").resolve()
+    script = Path(script_path).resolve()
+    # Хард-гарантия: скрипт обязан лежать в workspace/tools
+    if not str(script).startswith(str(tool_dir) + os.sep) or script.suffix != ".py":
+        return {
+            "allowed": False,
+            "mode": "denied",
+            "output": "",
+            "error": f"🚫 Тул вне workspace/tools: {script_path}"
+        }
+
+    cmd = [str(script)] + args
+
+    ts = datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"{ts} | mode=tool | allowed=True | cmd=python3 {script.name} {' '.join(args[:20])}\n"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(log_entry)
+    except Exception:
+        pass
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_sandbox_prefix("python3"),
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=WORKSPACE,
+            env={**os.environ, "LANG": "C", "TERM": "dumb", "HOME": str(WORKSPACE)},
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        output = stdout.decode("utf-8", errors="replace").strip()
+        err_output = stderr.decode("utf-8", errors="replace").strip()
+
+        max_lines = 60
+        lines = output.split("\n")
+        if len(lines) > max_lines:
+            output = "\n".join(lines[:max_lines]) + f"\n... ({len(lines) - max_lines} строк обрезано)"
+
+        return {
+            "allowed": True,
+            "mode": "tool",
+            "output": output or "(пустой вывод)",
+            "error": err_output,
+            "returncode": proc.returncode,
+        }
+    except asyncio.TimeoutError:
+        return {
+            "allowed": True,
+            "mode": "tool",
+            "output": "",
+            "error": f"⏰ Таймаут {timeout} сек"
+        }
+    except Exception as e:
+        return {
+            "allowed": True,
+            "mode": "tool",
             "output": "",
             "error": f"❌ Ошибка: {e}"
         }
