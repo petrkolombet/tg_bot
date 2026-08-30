@@ -1,0 +1,20 @@
+[Unit]
+Description=TG bot browser daemon (playwright chromium-headless-shell)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tg_bot
+ExecStart=/usr/bin/python3 /root/tg_bot/browser_daemon.py
+Restart=on-failure
+RestartSec=3
+Environment="HOME=/root"
+Environment="no_proxy=localhost,127.0.0.1"
+Environment="BROWSER_IDLE_SECONDS=300"
+# Прокси (если нужен) задаётся через /etc/tg-browser.env,
+# который генерит deploy/bootstrap_browser.sh — НЕ хардкодить здесь.
+EnvironmentFile=/etc/tg-browser.env
+
+[Install]
+WantedBy=multi-user.target

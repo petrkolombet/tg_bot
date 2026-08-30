@@ -8,5 +8,9 @@ state.json
 *.log
 .venv/
 venv/
-workspace/
+workspace/*
+!workspace/tools/
+workspace/tools/*
+!workspace/tools/browser_tool.py
+
 rag_storage/
