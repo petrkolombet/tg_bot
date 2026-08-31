@@ -5,6 +5,7 @@ import asyncio
 import random
 import datetime
 import os
+import json
 from datetime import timezone
 from telegram import Update
 from telegram.constants import ChatAction
@@ -295,6 +296,19 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
 
             logger.info(f"✅🔧 [RESULT] {out_block}")
 
+            # Если file.read прочитал картинку — тул вернул {kind:"image", absolute_path,...}.
+            # Тогда прикрепляем картинку к следующему g4f-запросу (полный промт + image_url),
+            # как если бы пользователь прислал её в чат.
+            image_path = None
+            try:
+                tool_raw = json.loads(out_block) if out_block.strip().startswith("{") else {}
+            except (ValueError, TypeError):
+                tool_raw = {}
+            tool_result = tool_raw.get("result", tool_raw) if isinstance(tool_raw, dict) else {}
+            if isinstance(tool_result, dict) and tool_result.get("kind") == "image":
+                image_path = tool_result.get("absolute_path")
+                out_block = f"Изображение {tool_result.get('path', '?')} ({tool_result.get('size', '?')} байт) прикреплено к запросу."
+
             if len(out_block) <= config.TOOL_RESULT_LIMIT:
                 report = out_block
             else:
@@ -305,7 +319,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             tool_context = f"Результат вызова тула '{call_str}':\n---\n{out_block}\n---"
             if error:
                 tool_context += f"\nОшибки stderr:\n{error}"
-            decision = await process_user_input(user_text, state_manager, memory_context=tool_context)
+            decision = await process_user_input(user_text, state_manager, memory_context=tool_context, image_path=image_path)
 
         elif decision.get("server_command"):
             server_spec = decision["server_command"]

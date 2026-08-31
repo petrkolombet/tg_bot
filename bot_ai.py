@@ -5,6 +5,7 @@ import asyncio
 import json
 import re
 import os
+import base64
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -36,12 +37,22 @@ def _g4f_urlopen(req, timeout=180):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-async def safe_generate_content_g4f(prompt, temperature=0.85):
+async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
     """Фолбек-генерация через g4f.space (чужие аккаунты, PoW-кредиты).
     Модель gemini-3.5-flash. Ретраи при 429/сбоях. Возвращает текст или None."""
+    content = prompt
+    if image_path:
+        data, mime = _read_image_b64(image_path)
+        if data:
+            b64 = base64.b64encode(data).decode("ascii")
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+            ]
+            logger.info(f"🖼️ [G4F] Картинка прикреплена: {image_path} ({len(data)} байт)")
     payload = json.dumps({
         "model": config.G4F_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": content}],
         "temperature": temperature
     }).encode('utf-8')
     url = f"{config.G4F_URL}/chat/completions"
@@ -64,7 +75,31 @@ async def safe_generate_content_g4f(prompt, temperature=0.85):
                 await asyncio.sleep(3)
     return None
 
-async def safe_generate_content(prompt, temperature=0.85):
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+def _read_image_b64(path):
+    """Читает файл-картинку и возвращает (base64_str, mime). None если не картинка."""
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in IMAGE_EXTS:
+            return None, None
+        with open(path, "rb") as f:
+            data = f.read()
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}.get(ext.lstrip("."), "image/png")
+        return data, mime
+    except Exception as e:
+        logger.warning(f"⚠️ [IMAGE] Не удалось прочитать картинку {path}: {e}")
+        return None, None
+
+
+async def safe_generate_content(prompt, temperature=0.85, image_path=None):
+    # Картинки умеет ТОЛЬКО g4f.space — свой Google-аккаунт режет image input
+    # (BardErrorInfo 1100). Поэтому фото уходим сразу в g4f, минуя Gemini.
+    if image_path:
+        logger.info("🖼️ [GEMINI] Картинка — иду сразу в g4f.space (свой Gemini фото не умеет)")
+        return await safe_generate_content_g4f(prompt, temperature, image_path=image_path)
+
     payload = json.dumps({
         "model": config.GEMINI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -700,7 +735,7 @@ async def generate_reflection(state_manager):
             return parsed["thoughts"]
     return []
 
-async def process_user_input(user_text, state_manager, memory_context=None):
+async def process_user_input(user_text, state_manager, memory_context=None, image_path=None):
     try:
         with open(config.PROMPT_FILE, 'r', encoding='utf-8') as f: 
             prompt_template = f.read()
@@ -781,7 +816,17 @@ async def process_user_input(user_text, state_manager, memory_context=None):
     except Exception as e:
         logger.warning(f"⚠️ [DEBUG] Не удалось сохранить промпт: {e}")
 
-    raw_text = await safe_generate_content(prompt)
+    # Определяем, является ли вход картинкой: "[файл]: <путь>" с расширением-картинкой.
+    # image_path может прийти извне (file.read на картинке из bot_handlers) или быть
+    # найденным здесь — при реальной отправке фото в чат ("[файл]: <путь>" в user_text).
+    if not image_path and not is_system_trigger:
+        m = re.match(r"^\[файл\]:\s*(.+)$", user_text.strip())
+        if m:
+            cand = m.group(1).strip()
+            if os.path.splitext(cand)[1].lower() in IMAGE_EXTS and os.path.isfile(cand):
+                image_path = cand
+
+    raw_text = await safe_generate_content(prompt, image_path=image_path)
     parsed_json = await try_parse_or_repair_json(raw_text)
     
     if parsed_json:
