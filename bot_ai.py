@@ -338,12 +338,41 @@ def perplexity_search(query):
     return out or None
 
 def _g4f_search_cleanup(text):
-    """g4f-Gemini склеивает черновик и финальный ответ с дублями цитат.
-    Финальный ответ идёт ПОСЛЕ последней 'черновой' вложенной цитаты вида
-    [[N]]([url](url). Если таких нет — возвращаем текст как есть."""
-    ends = [m.end() for m in re.finditer(r'\[\[\d+\]\]\(\[[^\]]*\]\([^)]*\)', text)]
-    if ends:
-        text = text[ends[-1]:]
+    """Убирает авто-цитаты g4f-Gemini ([[N]](url)/[[N]]([url](url)) и схлопывает
+    склеенные черновик+финал. Markdown-ссылки вида [url](url), где текст==адрес,
+    разворачиваются в голый URL. Блок источников внизу НЕ трогается."""
+    text = re.sub(r'\[\[\d+\]\]\(\[[^\]]*\]\([^)]*\)', '', text)
+    text = re.sub(r'\[\[\d+\]\]\([^)]*\)', '', text)
+    text = re.sub(r'\[\[\d+\]\]', '', text)
+    # [url](url) -> url (текст ссылки совпадает с адресом)
+    text = re.sub(r'\[([^\]]*)\]\((\1)\)', r'\1', text)
+    # если первая половина абзацев == второй (дубль черновик+финал) — оставляем одну
+    paras = [p for p in text.split('\n\n') if p.strip()]
+    n = len(paras)
+    for i in range(n // 2, 0, -1):
+        if paras[:i] == paras[i:2 * i]:
+            paras = paras[:i]
+            break
+    text = '\n\n'.join(paras)
+    # если g4f склеил черновик+финал ВСТЫК: заголовок текста встречается дважды,
+    # берём с начала последнего вхождения; если после среза остаются только
+    # источники (ответ потерялся) — откатываемся к полному тексту
+    head = text[:60]
+    if head:
+        pos = -1
+        start = 0
+        while True:
+            hit = text.find(head, start)
+            if hit == -1:
+                break
+            pos = hit
+            start = hit + 1
+        if pos > 0:
+            candidate = text[pos:]
+            body = re.split(r'\n\s*>\s*\[0\]', candidate)[0]
+            if len(body.strip()) >= 40:
+                text = candidate
+    text = re.sub(r'\s+([.,;:!?])', r'\1', text).strip()
     return text.strip()
 
 
@@ -353,7 +382,7 @@ async def search_web_g4f(query):
     IP, что у бейкера). Ретраи при 429/сбоях. Возвращает текст или None."""
     payload = json.dumps({
         "model": "gemini-2.5-flash",
-        "messages": [{"role": "user", "content": f"Найди в интернете и ответь БЕЗ лишних слов: {query}"}],
+        "messages": [{"role": "user", "content": f"Найди в интернете и ответь БЕЗ лишних слов: {query}\nЕсли просят прямую ссылку — ОБЯЗАТЕЛЬНО возьми URL из найденного источника (проверенного в поиске), не придумывай его.\nОтвечай ТОЛЬКО обычным текстом, без markdown и разметки. Ссылки пиши голым URL, ровно как они есть в источнике."}],
         "temperature": 0.3,
         "web_search": True
     }).encode('utf-8')
