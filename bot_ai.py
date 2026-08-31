@@ -78,7 +78,8 @@ async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 
 def _read_image_b64(path):
-    """Читает файл-картинку и возвращает (base64_str, mime). None если не картинка."""
+    """Читает файл-картинку и возвращает (base64_str, mime). None если не картинка.
+    Если картинка больше 1024px по любой стороне — уменьшает до 1024px (пропорции сохраняются)."""
     try:
         ext = os.path.splitext(path)[1].lower()
         if ext not in IMAGE_EXTS:
@@ -87,6 +88,25 @@ def _read_image_b64(path):
             data = f.read()
         mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                 "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}.get(ext.lstrip("."), "image/png")
+        # Ресайз если картинка больше 1024px по любой стороне
+        if len(data) > 100_000:
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(data))
+                w, h = img.size
+                if max(w, h) > 1024:
+                    ratio = 1024 / max(w, h)
+                    new_w, new_h = int(w * ratio), int(h * ratio)
+                    img = img.resize((new_w, new_h), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    save_fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG",
+                                "webp": "WEBP", "gif": "GIF", "bmp": "BMP"}.get(ext.lstrip("."), "JPEG")
+                    img.save(buf, format=save_fmt, quality=85)
+                    data = buf.getvalue()
+                    logger.info(f"🖼️ [IMAGE] Ресайз {w}x{h} → {new_w}x{new_h} ({len(data)} байт)")
+            except Exception as e:
+                logger.warning(f"⚠️ [IMAGE] Не удалось уменьшить картинку: {e}")
         return data, mime
     except Exception as e:
         logger.warning(f"⚠️ [IMAGE] Не удалось прочитать картинку {path}: {e}")

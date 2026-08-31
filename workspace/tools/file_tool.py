@@ -18,7 +18,7 @@ TOOL = {
     "description": "Файлы в твоём workspace: чтение/директории, поиск, точечные правки.",
     "methods": {
         "read": {
-            "description": "Содержимое файла, или список файлов в каталоге (с размерами и датами)",
+            "description": "Содержимое файла (текст), список файлов в каталоге, или изображение (jpg/png/webp — ты его увидишь)",
             "params": [
                 {"name": "path", "type": "str", "required": True, "description": "путь относительно workspace"}
             ],
@@ -75,9 +75,12 @@ def read(path):
     """Вернуть содержимое файла или список содержимого каталога."""
     import datetime as _dt
 
-    full = _path(path)
+    try:
+        full = _path(path)
+    except ValueError as e:
+        return {"kind": "error", "message": str(e)}
     if not full.exists():
-        raise FileNotFoundError(f"нет такого пути: {path!r}")
+        return {"kind": "error", "message": f"нет такого пути: {path!r}"}
     if full.is_dir():
         out = []
         for item in sorted(full.iterdir()):
@@ -95,7 +98,12 @@ def read(path):
             "size": full.stat().st_size,
             "mime": _MIME_MAP.get(full.suffix.lower(), "image/png"),
         }
-    data = full.read_bytes()
+    try:
+        data = full.read_bytes()
+    except PermissionError:
+        return {"kind": "error", "message": f"нет доступа к файлу: {path!r}"}
+    except OSError as e:
+        return {"kind": "error", "message": f"ошибка чтения {path!r}: {e}"}
     text = data.decode("utf-8", errors="replace")
     if len(text) > 30000:
         return {"path": path, "kind": "file", "size": len(data),
