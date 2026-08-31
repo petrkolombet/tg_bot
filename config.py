@@ -69,6 +69,7 @@ if not GROQ_KEYS:
 # --- Имена файлов ---
 STATE_FILE = "state.json"
 PROMPT_FILE = "prompt_template.txt"
+INCOMING_DIR = "workspace/incoming"  # каталог для входящих файлов от пользователя
 
 # --- Временные интервалы ---
 CHECK_INTERVAL_SECONDS = 60

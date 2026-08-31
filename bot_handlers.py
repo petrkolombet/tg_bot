@@ -4,6 +4,7 @@ import logging
 import asyncio
 import random
 import datetime
+import os
 from datetime import timezone
 from telegram import Update
 from telegram.constants import ChatAction
@@ -540,6 +541,107 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("💡<- [все реплики продублированы дедупом]")
         else:
             logger.info("💡<- [молчание]")
+    finally:
+        stop_typing.set()
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приём и сохранение входящих файлов (документы, фото, аудио, видео).
+    Файл сохраняется в INCOMING_DIR с оригинальным именем (или сгенерированным
+    по типу), в историю уходит запись [файл]: путь. Голосовые/кружки НЕ трогает —
+    у них отдельный хендлер."""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+
+    msg = update.message
+    user_id = update.effective_user.id
+    state_manager = context.bot_data["state_manager"]
+    process_user_input = context.bot_data["process_user_input"]
+
+    # Определяем источник, оригинальное имя и тип
+    src = None
+    orig_name = None
+    if msg.document:
+        src = msg.document
+        orig_name = msg.document.file_name
+    elif msg.photo:
+        src = msg.photo[-1]  # самое большое разрешение
+        orig_name = None
+    elif msg.audio:
+        src = msg.audio
+        orig_name = getattr(msg.audio, "file_name", None)
+    elif msg.video:
+        src = msg.video
+        orig_name = getattr(msg.video, "file_name", None)
+    else:
+        return
+
+    if not src:
+        return
+
+    kind = "photo" if msg.photo else ("video" if msg.video else ("audio" if msg.audio else "doc"))
+    ext = os.path.splitext(orig_name)[1] if orig_name else ""
+    if not ext:
+        ext = {kind: ".jpg" if kind == "photo" else ".mp4" if kind == "video" else ".mp3" if kind == "audio" else ".bin"}[kind]
+
+    # Уникальное имя: оригинальное, при коллизии — с таймштампом
+    os.makedirs(config.INCOMING_DIR, exist_ok=True)
+    base = os.path.splitext(orig_name)[0] if orig_name else kind
+    candidate = os.path.join(config.INCOMING_DIR, (orig_name or f"{base}{ext}"))
+    if os.path.exists(candidate):
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        candidate = os.path.join(config.INCOMING_DIR, f"{base}_{ts}{ext}")
+    # если и так коллизия (одна и та же секунда) — добиваем счётчиком
+    n = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(config.INCOMING_DIR, f"{os.path.splitext(candidate)[0]}_{n}{ext}")
+
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(_typing_loop(context.bot, user_id, stop_typing))
+    try:
+        file = None
+        for attempt in range(3):
+            try:
+                file = await context.bot.get_file(src.file_id)
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ [FILE] get_file попытка {attempt+1}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2)
+        if not file:
+            await update.message.reply_text("не скачал файл, повтори")
+            return
+
+        downloaded = await file.download_as_bytearray()
+        with open(candidate, "wb") as f:
+            f.write(downloaded)
+
+        logger.info(f"📄-> Файл сохранён: {candidate} ({len(downloaded)} байт)")
+        await state_manager.add_history("user", f"[файл]: {candidate}")
+        asyncio.create_task(insert_to_rag(f"Пользователь отправил файл: {candidate}", metadata=f"user_{user_id}"))
+        await state_manager.update_interaction()
+
+        # Пропускаем через обычный конвейер, чтобы модель "знала" о файле
+        initial_decision = await process_user_input(f"[файл]: {candidate}", state_manager)
+        decision = await _tool_loop(update, context, state_manager, f"[файл]: {candidate}", initial_decision)
+
+        if not decision:
+            return
+
+        replies = _flatten_replies(decision.get("replies"))
+        if not replies and (single_text := decision.get("text")):
+            replies = [single_text] if isinstance(single_text, str) and len(single_text) > 0 else []
+        for i, message_text in enumerate(replies):
+            sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+            if not sent:
+                continue
+            await state_manager.add_history("model", message_text)
+            asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
+            if i < len(replies) - 1:
+                await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
+                await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.error(f"💥 [FILE] Ошибка сохранения: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ ошибка при сохранении файла: {e}")
     finally:
         stop_typing.set()
 
