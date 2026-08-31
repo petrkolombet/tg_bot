@@ -70,6 +70,7 @@ if not GROQ_KEYS:
 STATE_FILE = "state.json"
 PROMPT_FILE = "prompt_template.txt"
 INCOMING_DIR = "workspace/incoming"  # каталог для входящих файлов от пользователя
+LLM_DEBUG_FILE = "last_gemini_prompt.txt"  # последний промпт, ушедший в Gemini (перезаписывается)
 
 # --- Временные интервалы ---
 CHECK_INTERVAL_SECONDS = 60

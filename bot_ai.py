@@ -4,6 +4,7 @@ import logging
 import asyncio
 import json
 import re
+import os
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -93,18 +94,21 @@ async def safe_generate_content(prompt, temperature=0.85):
     logger.warning("⚠️ [GEMINI] 3 попытки провалились — пробую g4f.space фолбек")
     return await safe_generate_content_g4f(prompt, temperature)
 
-async def safe_generate_deepseek(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_deepseek"):
+async def safe_generate_deepseek(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_deepseek", session_type=None):
     """Генерация через DeepSeek-прокси (OpenAI-совместимый). Модель/прокси берутся
     из конфига; для рефлексии можно указать свои. Возвращает текст или None."""
     model = model or config.DEEPSEEK_MODEL
     proxy_url = proxy_url or config.DEEPSEEK_PROXY_URL
     proxy_key = proxy_key or config.DEEPSEEK_PROXY_KEY
     logger.info(f"📤 [DEEPSEEK:{model}] Отправка промпта длиной: {len(prompt)} символов")
-    payload = json.dumps({
+    payload_dict = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature
-    }).encode('utf-8')
+    }
+    if session_type:
+        payload_dict["session_type"] = session_type
+    payload = json.dumps(payload_dict).encode('utf-8')
 
     req = urllib.request.Request(
         f"{proxy_url}/v1/chat/completions",
@@ -569,8 +573,11 @@ async def update_longterm_summary(state_manager):
         "ЗАДАЧА 2 — проверь ИНТЕРЕСЫ (темы из списка ниже): определи, какие из них ЯВНО уже выполнены в этих 50 сообщениях — "
         "когда тему начал Ты САМ, без запроса пользователя (сам начал разговор про неё, сам задал вопрос, сам предложил/напомнил). "
         "Помечай как выполненную ТОЛЬКО такие темы. Если тема лишь упоминалась вскользь или её поднял сам пользователь — НЕ помечай. Не надумывай, никаких ложных срабатываний.\n\n"
-        "ОТВЕЧАЙ ТОЛЬКО JSON (без объяснений): {\"summary\": \"саммари до 800 символов\", \"done_interests\": [\"id1\", \"id2\"]}. "
-        "done_interests — список id выполненных интересов (может быть пустым)."
+        "СТРОГОЕ ПРАВИЛО ФОРМАТА: Ты ОБЯЗАН вернуть ТОЛЬКО JSON ровно в этом формате:\n"
+        '{"summary": "текст саммари", "done_interests": ["id1", "id2"]}\n'
+        "Никакого другого JSON. Никаких мыслей, обсуждений, действий — ТОЛЬКО summary и done_interests.\n"
+        "Если.done_interests пуст — верни пустой массив: \"done_interests\": []\n"
+        "Если поле summary отсутствует или содержит thoughts/discussions/actions — ответ СЧИТАЕТСЯ ОШИБКОЙ."
     )
 
     user_prompt = (
@@ -586,9 +593,32 @@ async def update_longterm_summary(state_manager):
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3,
-        "user": "tg_bot_summary"
+        "user": "tg_bot_summary",
+        "session_type": "summary"
     }
 
+    # --- ОСНОВНОЙ канал: ChatGPT (анонимный скрапер) ---
+    # Убираем session_type перед отправкой в ChatGPT (ему он не нужен)
+    chatgpt_payload = dict(payload_dict)
+    chatgpt_payload.pop("session_type", None)
+    fb = await _summary_fallback(chatgpt_payload, "SUMMARY")
+    if fb:
+        try:
+            parsed = json.loads(clean_json_response(fb))
+            if isinstance(parsed.get("summary"), str) and not parsed.get("thoughts"):
+                summary_text = parsed["summary"].strip()
+                legit_ids = {t["id"] for t in interests}
+                done = [x for x in (parsed.get("done_interests") or []) if x in legit_ids]
+                await state_manager.set_summary(summary_text)
+                if done:
+                    await state_manager.remove_interests(done)
+                return summary_text
+            logger.warning(f"⚠️ [SUMMARY] ChatGPT вернул невалидный формат, ухожу на Alice")
+        except (json.JSONDecodeError, AttributeError):
+            # Не JSON — но это может быть чистый саммари-текст, пробуем Alice
+            logger.warning(f"⚠️ [SUMMARY] ChatGPT вернул не JSON, ухожу на Alice")
+
+    # --- Запасной канал: Alice ---
     req = urllib.request.Request(
         f"{config.SUMMARY_PROXY_URL}/v1/chat/completions",
         data=json.dumps(payload_dict).encode('utf-8'),
@@ -597,36 +627,37 @@ async def update_longterm_summary(state_manager):
             "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
         }
     )
-
     for attempt in range(2):
         try:
             loop = asyncio.get_running_loop()
             resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=60))
             data = json.loads(resp.read().decode('utf-8'))
             text = data["choices"][0]["message"]["content"].strip()
-            logger.info(f"📌 [SUMMARY] Ответ получен: {len(text)} символов")
+            logger.info(f"📌 [SUMMARY] Alice ответ получен: {len(text)} символов")
             try:
                 parsed = json.loads(clean_json_response(text))
-                summary_text = (parsed.get("summary") or text).strip()
-                legit_ids = {t["id"] for t in interests}
-                done = [x for x in (parsed.get("done_interests") or []) if x in legit_ids]
-                await state_manager.set_summary(summary_text)
-                if done:
-                    await state_manager.remove_interests(done)
-                return summary_text
+                if isinstance(parsed.get("summary"), str) and not parsed.get("thoughts"):
+                    summary_text = parsed["summary"].strip()
+                    legit_ids = {t["id"] for t in interests}
+                    done = [x for x in (parsed.get("done_interests") or []) if x in legit_ids]
+                    await state_manager.set_summary(summary_text)
+                    if done:
+                        await state_manager.remove_interests(done)
+                    return summary_text
+                logger.warning(f"⚠️ [SUMMARY] Alice невалидный формат (попытка {attempt+1})")
+                if attempt < 1:
+                    await asyncio.sleep(2)
+                else:
+                    await state_manager.set_summary(text)
+                    return text
             except (json.JSONDecodeError, AttributeError):
-                logger.warning("⚠️ [SUMMARY] Ответ не JSON — сохраняю как есть")
+                logger.warning("⚠️ [SUMMARY] Alice ответ не JSON — сохраняю как есть")
                 await state_manager.set_summary(text)
                 return text
         except Exception as e:
-            logger.error(f"❌ [SUMMARY] Ошибка (попытка {attempt+1}): {e}")
+            logger.error(f"❌ [SUMMARY] Alice ошибка (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
-    # Фолбек на ChatGPT (Алиса упала) — сохраняем сырой текст, JSON не ждём
-    fb = await _summary_fallback(payload_dict, "SUMMARY-LONG")
-    if fb:
-        await state_manager.set_summary(fb)
-        return fb
     return None
 
 async def generate_reflection(state_manager):
@@ -646,18 +677,28 @@ async def generate_reflection(state_manager):
     if state_manager.state["background_thoughts"]:
         existing_thoughts_text = "\n".join([f'- {t["text"]}' for t in state_manager.state["background_thoughts"]])
     
-    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — свой внутренний монолог. Прочитай свой недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям и глубоким. Замечай то, чего не говорили, но чувствовали. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговлра. О чем то радуешься, беспокоишься, привыкаешь, злишся, обижаешься? Пример(не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, твои мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злосью или чем-то совершенно другим или смешанным. Описывай мысли максимально чуственно, используй прилагательные и слова которые точно описывают твои мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
+    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — внутренний монолог. Прочитай недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям. Мысли не должны быть отражением очевидного из разговора. Замечай то, чего не говорили в диалоге. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговора. О чем-то радуешься, беспокоишься, привыкаешь, злишся, обижаешься. Пример (не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злостью или чем-то совершенно другим или смешанным. Описывай мысли точно, используй прилагательные и слова которые точно описывают мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Важно: Не говори факты и рассуждения, которые не являются мыслями. Мысли - это внутренние переживания определенных эмоций, а не рассуждения о проделанной работе. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
-    raw_text = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection")
+    # --- ОСНОВНОЙ канал: ChatGPT (анонимный скрапер) ---
+    fb_dict = {
+        "model": config.REFLECTION_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": config.REFLECTION_TEMPERATURE,
+    }
+    raw_text = await _summary_fallback(fb_dict, "REFLECTION")
+    # --- Запасной канал: Alice ---
     if not raw_text:
-        fb_dict = {
-            "model": config.REFLECTION_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": config.REFLECTION_TEMPERATURE,
-        }
-        raw_text = await _summary_fallback(fb_dict, "REFLECTION")
+        raw_text = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
     parsed = await try_parse_or_repair_json(raw_text)
-    return parsed.get("thoughts", []) if parsed else []
+    if parsed and parsed.get("thoughts"):
+        return parsed["thoughts"]
+    # Если вернул мусор — пробуем ещё раз через Alice напрямую
+    if not (parsed and parsed.get("thoughts")):
+        alice_raw = await safe_generate_deepseek(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
+        parsed = await try_parse_or_repair_json(alice_raw) if alice_raw else None
+        if parsed and parsed.get("thoughts"):
+            return parsed["thoughts"]
+    return []
 
 async def process_user_input(user_text, state_manager, memory_context=None):
     try:
@@ -733,6 +774,13 @@ async def process_user_input(user_text, state_manager, memory_context=None):
         user_text=user_text
     )
     
+    # сохраняем последний промпт (перезаписывается) в файл бота для отладки
+    try:
+        with open(config.LLM_DEBUG_FILE, 'w', encoding='utf-8') as f:
+            f.write(prompt)
+    except Exception as e:
+        logger.warning(f"⚠️ [DEBUG] Не удалось сохранить промпт: {e}")
+
     raw_text = await safe_generate_content(prompt)
     parsed_json = await try_parse_or_repair_json(raw_text)
     
