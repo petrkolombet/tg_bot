@@ -14,16 +14,14 @@ from memorylite.compiler import ContextCompiler
 
 logger = logging.getLogger(__name__)
 
+import config
+
 WORKING_DIR = "/root/tg_bot/rag_storage"
 DB_NAME = "memorylite.sqlite3"
 
-GEMINI_PROXY_URL = os.getenv("GEMINI_PROXY_URL", "http://127.0.0.1:4984")
-GEMINI_PROXY_KEY = os.getenv("GEMINI_PROXY_KEY", "sk-gemini")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-
-DEEPSEEK_URL = "http://127.0.0.1:9655"
-DEEPSEEK_KEY = "sk-freedeepseek"
-DEEPSEEK_MODEL = "deepseek-chat"
+RAG_URL = config.RAG_URL
+RAG_KEY = config.RAG_KEY
+RAG_MODEL = config.RAG_MODEL
 
 _agent = None
 
@@ -66,9 +64,13 @@ class FreshSessionJSONClient(OpenAICompatibleJSONClient):
         return parsed
 
     def _delete_session(self, user_id):
+        # Удаление сессий умеет только freedeepseek-api (порт 9655).
+        # Остальных провайдеров (GPT/Gemini/g4f и т.п.) не трогаем.
         try:
-            import urllib.request
             base = self.base_url.rsplit("/v1", 1)[0]
+            base_hostport = (urllib.parse.urlsplit(base).hostname, urllib.parse.urlsplit(base).port)
+            if base_hostport not in (("localhost", 9655), ("127.0.0.1", 9655)):
+                return
             req = urllib.request.Request(
                 url=f"{base}/session?agent={urllib.parse.quote(user_id)}",
                 method="DELETE",
@@ -76,7 +78,7 @@ class FreshSessionJSONClient(OpenAICompatibleJSONClient):
             with urllib.request.urlopen(req, timeout=10) as resp:
                 resp.read()
         except Exception as e:
-            logger.warning(f"⚠️ Не удалил сессию DeepSeek {user_id}: {e}")
+            logger.warning(f"⚠️ Не удалил сессию LLM {user_id}: {e}")
 
 
 def _get_agent():
@@ -95,9 +97,9 @@ def _get_agent():
     )
 
     client = FreshSessionJSONClient(
-        model=DEEPSEEK_MODEL,
-        base_url=f"{DEEPSEEK_URL}/v1",
-        api_key=DEEPSEEK_KEY,
+        model=RAG_MODEL,
+        base_url=f"{RAG_URL.rstrip('/').rsplit('/v1', 1)[0]}/v1",
+        api_key=RAG_KEY,
     )
 
     _agent = MemoryAgent(config=config, client=client)

@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("cake_baker")
 
 CAKE_URL = "https://g4f.space/cake"
-PROXY = config.G4F_PROXY  # idem config; задачи на одном IP
+PROXY = config.PROXY_G4F  # idem config; задачи на одном IP
 BATCH = 5                 # UUID за цикл (server caps at 50)
 SLEEP_BETWEEN = 20        # сек между циклами (не долбим прокси)
 SLEEP_AFTER_LIMIT = 3600  # сек сна при дневном лимите

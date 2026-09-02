@@ -2,12 +2,12 @@
 
 import logging
 import os
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters
 
 import config
 from bot_state import StateManager
 import bot_ai
-from bot_handlers import handle_message, handle_voice, handle_file, handle_server, handle_sum, handle_think, background_tasks
+from bot_handlers import handle_message, handle_voice, handle_file, handle_server, handle_sum, handle_think, background_tasks, handle_stop, handle_restart, handle_models, handle_callback
 
 # Настройка логирования
 logging.basicConfig(
@@ -58,6 +58,10 @@ def main():
     app.add_handler(CommandHandler("server", handle_server))
     app.add_handler(CommandHandler("sum", handle_sum))
     app.add_handler(CommandHandler("think", handle_think))
+    app.add_handler(CommandHandler("stop", handle_stop))
+    app.add_handler(CommandHandler("restart", handle_restart))
+    app.add_handler(CommandHandler("models", handle_models))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))

@@ -6,8 +6,9 @@ import random
 import datetime
 import os
 import json
+import subprocess
 from datetime import timezone
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
@@ -413,7 +414,173 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
     logger.info(f"💬-> {user_text}")
-    
+
+    # Если редактируем переменную .env — перехватываем ввод
+    editing_key = context.user_data.get("editing_env_key")
+    if editing_key:
+        context.user_data.pop("editing_env_key", None)
+
+        if editing_key.startswith("fb_"):
+            # Фолбек: формат "fb_section"
+            section = editing_key[3:]
+            if section not in FALLBACK_KEYS:
+                await update.message.reply_text("❌ неизвестная секция")
+                return
+            fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+            parts = user_text.strip().split()
+            prov_name = context.user_data.pop("editing_provider", None)
+
+            if prov_name and prov_name in PROVIDERS:
+                prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+                updates = {fb_url_key: prov_url, fb_model_key: parts[0]}
+                if len(parts) == 2:
+                    updates[fb_key_key] = parts[1]
+                elif fb_key_key and prov_key:
+                    updates[fb_key_key] = prov_key
+                _write_env(updates)
+                text = f"✅ Фолбек {prov_name.upper()}: `{parts[0]}`"
+                if len(parts) == 2:
+                    text += f"\nКлюч: `{parts[1]}`"
+            else:
+                if len(parts) == 3:
+                    _write_env({fb_url_key: parts[0], fb_model_key: parts[1], fb_key_key: parts[2]})
+                    text = f"✅ Фолбек URL: `{parts[0]}`\nМодель: `{parts[1]}`\nКлюч: `{parts[2]}`"
+                elif len(parts) == 2:
+                    if parts[1].startswith("sk-") or parts[1].startswith("key-"):
+                        _write_env({fb_model_key: parts[0], fb_key_key: parts[1]})
+                        text = f"✅ Фолбек Модель: `{parts[0]}`\nКлюч: `{parts[1]}`"
+                    else:
+                        _write_env({fb_url_key: parts[0], fb_model_key: parts[1]})
+                        text = f"✅ Фолбек URL: `{parts[0]}`\nМодель: `{parts[1]}`"
+                else:
+                    model = parts[0]
+                    found = False
+                    for pn, (pu, pk, pm, pp) in PROVIDERS.items():
+                        if model == pm:
+                            _write_env({fb_url_key: pu, fb_model_key: model})
+                            if fb_key_key and pk:
+                                _write_env({fb_key_key: pk})
+                            text = f"✅ Фолбек {pn.upper()}\nURL: `{pu}`\nМодель: `{model}`"
+                            found = True
+                            break
+                    if not found:
+                        _write_env({fb_model_key: model})
+                        text = f"✅ Фолбек Модель: `{model}`"
+
+            await update.message.reply_text(f"{text}\n\nперезапускаю...", parse_mode="Markdown")
+
+        elif editing_key in LLM_SECTIONS:
+            # Формат: "модель" или "модель ключ"
+            parts = user_text.strip().split()
+            url_key, key_key, model_key = SECTION_KEYS[editing_key]
+            prov_name = context.user_data.pop("editing_provider", None)
+
+            if prov_name and prov_name in PROVIDERS:
+                prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+                updates = {url_key: prov_url, model_key: parts[0]}
+                if len(parts) == 2:
+                    updates[key_key] = parts[1]
+                elif key_key and prov_key:
+                    updates[key_key] = prov_key
+                _write_env(updates)
+                text = f"✅ {prov_name.upper()}: `{parts[0]}`"
+                if len(parts) == 2:
+                    text += f"\nКлюч: `{parts[1]}`"
+            else:
+                if len(parts) == 3:
+                    _write_env({url_key: parts[0], model_key: parts[1], key_key: parts[2]})
+                    text = f"✅ URL: `{parts[0]}`\nМодель: `{parts[1]}`\nКлюч: `{parts[2]}`"
+                elif len(parts) == 2:
+                    if parts[1].startswith("sk-") or parts[1].startswith("key-"):
+                        _write_env({model_key: parts[0], key_key: parts[1]})
+                        text = f"✅ Модель: `{parts[0]}`\nКлюч: `{parts[1]}`"
+                    else:
+                        _write_env({url_key: parts[0], model_key: parts[1]})
+                        text = f"✅ URL: `{parts[0]}`\nМодель: `{parts[1]}`"
+                else:
+                    model = parts[0]
+                    found = False
+                    for pn, (pu, pk, pm, pp) in PROVIDERS.items():
+                        if model == pm:
+                            _write_env({url_key: pu, model_key: model})
+                            if key_key and pk:
+                                _write_env({key_key: pk})
+                            text = f"✅ {pn.upper()}\nURL: `{pu}`\nМодель: `{model}`"
+                            found = True
+                            break
+                    if not found:
+                        _write_env({model_key: model})
+                        text = f"✅ Модель: `{model}`"
+
+            await update.message.reply_text(f"{text}\n\nперезапускаю...", parse_mode="Markdown")
+        else:
+            # Старый формат: одиночная переменная
+            _write_env({editing_key: user_text.strip()})
+            await update.message.reply_text(f"✅ `{editing_key}` = `{user_text.strip()}`\n\nперезапускаю...", parse_mode="Markdown")
+
+        import subprocess
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+
+    # Если редактируем прокси провайдера — перехватываем ввод
+    editing_proxy = context.user_data.get("editing_proxy")
+    if editing_proxy:
+        context.user_data.pop("editing_proxy", None)
+        proxy_env_key = config.PROXY_ENV_KEYS.get(editing_proxy, "")
+        if not proxy_env_key:
+            await update.message.reply_text("❌ неизвестный провайдер")
+            return
+
+        proxy_str = user_text.strip()
+        # Валидация формата host:port:user:pass
+        parts = proxy_str.split(":")
+        if len(parts) not in (2, 4):
+            await update.message.reply_text(
+                "❌ неверный формат. Используй:\n"
+                "`host:port:user:pass`\n"
+                "или `host:port` (без аутентификации)",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Сохраняем в .env
+        _write_env({proxy_env_key: proxy_str})
+
+        # Сохраняем в saved_proxies.json если ещё нет
+        try:
+            with open("/root/tg_bot/saved_proxies.json", "r") as f:
+                saved = json.load(f)
+        except Exception:
+            saved = []
+
+        host = parts[0]
+        # Проверяем есть ли уже такой прокси
+        exists = any(sp['host'] == host for sp in saved)
+        if not exists and len(parts) == 4:
+            saved.append({
+                "name": f"Кастомный ({host})",
+                "host": parts[0],
+                "port": parts[1],
+                "user": parts[2],
+                "pass": parts[3],
+            })
+            with open("/root/tg_bot/saved_proxies.json", "w") as f:
+                json.dump(saved, f, indent=2, ensure_ascii=False)
+
+        await update.message.reply_text(
+            f"✅ Прокси для {editing_proxy.upper()}: `{proxy_str}`\n\nперезапускаю...",
+            parse_mode="Markdown",
+        )
+        import subprocess
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(context.bot, user_id, stop_typing))
     
@@ -825,3 +992,735 @@ async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("💥 [THINK] Ошибка рефлексии!", exc_info=True)
         await update.message.reply_text(f"❌ ошибка: {e}")
+
+
+# --- /stop: остановка текущей генерации ---
+
+async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Останавливает текущую генерацию ответа."""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+    import bot_ai
+    bot_ai.request_stop()
+    await update.message.reply_text("⏹ остановлено")
+
+
+# --- /restart: перезапуск бота ---
+
+async def handle_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Перезапускает tg-bot.service через systemctl."""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+    await update.message.reply_text("🔄 перезапускаю бота...")
+    try:
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ ошибка перезапуска: {e}")
+
+
+# --- /models: выбор модели ---
+
+def _read_env():
+    """Читает .env в dict."""
+    env = {}
+    try:
+        with open(".env", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return env
+
+def _write_env(updates: dict):
+    """Обновляет переменные в .env (перезаписывает файл)."""
+    lines = []
+    env = _read_env()
+    env.update(updates)
+    # Перезаписываем в том же порядке, добавляем новые в конец
+    written = set()
+    try:
+        with open(".env", "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and "=" in stripped:
+                    k = stripped.split("=", 1)[0].strip()
+                    if k in env:
+                        lines.append(f'{k}="{env[k]}"')
+                        written.add(k)
+                        continue
+                lines.append(line.rstrip())
+    except FileNotFoundError:
+        pass
+    # Добавляем новые переменные
+    for k, v in env.items():
+        if k not in written:
+            lines.append(f'{k}="{v}"')
+    with open(".env", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+# Секции моделей: ключ -> (название, [(config_key, label), ...])
+LLM_SECTIONS = {
+    "main": ("🧠 Основная генерация", [
+        ("G4F_URL", "URL"),
+        ("G4F_KEY", "Ключ"),
+        ("G4F_MODEL", "Модель"),
+        ("MAIN_FALLBACK_URL", "Фолбек URL"),
+        ("MAIN_FALLBACK_KEY", "Фолбек Ключ"),
+        ("MAIN_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+    "search": ("🔍 Поиск", [
+        ("SEARCH_PROXY_URL", "URL"),
+        ("SEARCH_PROXY_KEY", "Ключ"),
+        ("SEARCH_MODEL", "Модель"),
+        ("SEARCH_FALLBACK_URL", "Фолбек URL"),
+        ("SEARCH_FALLBACK_KEY", "Фолбек Ключ"),
+        ("SEARCH_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+    "summary": ("📝 Саммари", [
+        ("SUMMARY_PROXY_URL", "URL"),
+        ("SUMMARY_PROXY_KEY", "Ключ"),
+        ("SUMMARY_MODEL", "Модель"),
+        ("SUMMARY_FALLBACK_URL", "Фолбек URL"),
+        ("SUMMARY_FALLBACK_KEY", "Фолбек Ключ"),
+        ("SUMMARY_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+    "reflection": ("💭 Рефлексия", [
+        ("REFLECTION_PROXY_URL", "URL"),
+        ("REFLECTION_PROXY_KEY", "Ключ"),
+        ("REFLECTION_MODEL", "Модель"),
+        ("REFLECTION_FALLBACK_URL", "Фолбек URL"),
+        ("REFLECTION_FALLBACK_KEY", "Фолбек Ключ"),
+        ("REFLECTION_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+    "rag": ("🧠 RAG (память)", [
+        ("RAG_URL", "URL"),
+        ("RAG_KEY", "Ключ"),
+        ("RAG_MODEL", "Модель"),
+        ("RAG_FALLBACK_URL", "Фолбек URL"),
+        ("RAG_FALLBACK_KEY", "Фолбек Ключ"),
+        ("RAG_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+}
+
+# Готовые провайдеры: имя -> (url, key, model)
+PROVIDERS = {
+    "alice": ("http://127.0.0.1:8000/v1", config.ALICE_KEY, "yandex-alice", config.PROXY_ALICE),
+    "gpt": ("http://127.0.0.1:5040/v1", config.GPT_KEY, "chatgpt", config.PROXY_GPT),
+    "deepseek": ("http://127.0.0.1:9655/v1", config.DEEPSEEK_KEY, "deepseek-chat", config.PROXY_DEEPSEEK),
+    "gemini": ("http://127.0.0.1:4984/v1", config.GEMINI_KEY, "gemini-3.6-flash", config.PROXY_GEMINI),
+    "g4f": ("https://g4f.space/api/gemini", "", "models/gemini-3.5-flash", config.PROXY_G4F),
+    "openrouter": ("https://openrouter.ai/api/v1", config.OPENROUTER_KEY, "minimax/minimax-m3:free", config.PROXY_OPENROUTER),
+}
+
+# Модели по провайдерам
+PROVIDER_MODELS = {
+    "g4f": [
+        ("models/gemini-3-flash-preview", "Gemini 3 Flash Preview"),
+        ("models/gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
+        ("models/gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite Preview"),
+        ("models/gemini-flash-latest", "Gemini Flash Latest"),
+        ("models/gemini-3.5-flash", "Gemini 3.5 Flash"),
+        ("models/gemini-3-pro-preview", "Gemini 3 Pro Preview"),
+        ("models/gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+        ("models/gemini-2.5-flash", "Gemini 2.5 Flash"),
+        ("models/gemini-2.5-pro", "Gemini 2.5 Pro"),
+        ("models/gemini-2.0-flash", "Gemini 2.0 Flash"),
+        ("models/gemini-2.0-flash-001", "Gemini 2.0 Flash 001"),
+        ("models/gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite"),
+        ("models/gemini-2.0-flash-lite-001", "Gemini 2.0 Flash Lite 001"),
+        ("models/gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash Preview TTS"),
+        ("models/gemini-2.5-pro-preview-tts", "Gemini 2.5 Pro Preview TTS"),
+        ("models/gemma-4-26b-a4b-it", "Gemma 4 26B"),
+        ("models/gemma-4-31b-it", "Gemma 4 31B"),
+        ("models/gemini-flash-lite-latest", "Gemini Flash Lite Latest"),
+        ("models/gemini-pro-latest", "Gemini Pro Latest"),
+        ("models/gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
+        ("models/gemini-2.5-flash-image", "Gemini 2.5 Flash Image"),
+        ("models/gemini-3.1-pro-preview-customtools", "Gemini 3.1 Pro Custom Tools"),
+        ("models/gemini-3.1-flash-lite-image", "Gemini 3.1 Flash Lite Image"),
+        ("models/gemini-3-pro-image-preview", "Gemini 3 Pro Image Preview"),
+        ("models/gemini-3-pro-image", "Gemini 3 Pro Image"),
+        ("models/gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image Preview"),
+        ("models/gemini-3.1-flash-image", "Gemini 3.1 Flash Image"),
+        ("models/gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash TTS"),
+        ("models/gemini-omni-flash-preview", "Gemini Omni Flash"),
+        ("models/gemini-3.5-live-translate-preview", "Gemini 3.5 Live Translate"),
+        ("models/gemini-3.1-flash-live-preview", "Gemini 3.1 Flash Live"),
+    ],
+    "openrouter": [
+        ("minimax/minimax-m3:free", "MiniMax M3 (free)"),
+    ],
+    "deepseek": [
+        ("deepseek-chat", "DeepSeek Chat"),
+        ("deepseek-reasoner", "DeepSeek Reasoner"),
+    ],
+    "gemini": [
+        ("gemini-3.6-flash", "Gemini 3.6 Flash"),
+        ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+        ("gemini-3.5-flash-thinking", "Gemini 3.5 Flash Thinking"),
+        ("gemini-3.5-flash-thinking-lite", "Gemini 3.5 Flash Thinking Lite"),
+        ("gemini-3.1-pro", "Gemini 3.1 Pro"),
+        ("gemini-3.1-pro-enhanced", "Gemini 3.1 Pro Enhanced"),
+        ("gemini-auto", "Gemini Auto"),
+        ("gemini-flash-lite", "Gemini Flash Lite"),
+    ],
+    "alice": [
+        ("yandex-alice", "Yandex Alice"),
+    ],
+    "gpt": [
+        ("chatgpt", "ChatGPT"),
+    ],
+}
+
+# Динамическая загрузка free-моделей OpenRouter
+import urllib.request
+import json as _json
+
+def _load_openrouter_free_models():
+    """Загружает список бесплатных моделей с OpenRouter."""
+    try:
+        proxy_str = config.PROXY_OPENROUTER or config.PROXY_G4F
+        proxy = config.parse_proxy(proxy_str) if proxy_str else None
+        if proxy:
+            proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            opener = urllib.request.build_opener(proxy_handler)
+        else:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request("https://openrouter.ai/api/v1/models")
+        resp = opener.open(req, timeout=15)
+        data = _json.loads(resp.read().decode("utf-8"))
+        free = [m for m in data.get("data", []) if ":free" in m["id"]]
+        models = [(m["id"], m["id"].split("/")[-1].replace(":free", "")) for m in sorted(free, key=lambda x: x["id"])]
+        if models:
+            PROVIDER_MODELS["openrouter"] = models
+            # Маппинг индекс → model_id для кнопок (Telegram лимит 64 байта)
+            OPENROUTER_MODEL_MAP.clear()
+            for i, (model_id, _) in enumerate(models):
+                OPENROUTER_MODEL_MAP[str(i)] = model_id
+            logger.info(f"✅ [OPENROUTER] Загружено {len(models)} free-моделей")
+    except Exception as e:
+        logger.warning(f"⚠️ [OPENROUTER] Не удалось загрузить модели: {e}")
+
+OPENROUTER_MODEL_MAP = {}
+_load_openrouter_free_models()
+
+# Маппинг секции -> ключи config.py для (url, key, model)
+SECTION_KEYS = {
+    "main": ("G4F_URL", "G4F_KEY", "G4F_MODEL"),
+    "search": ("SEARCH_PROXY_URL", "SEARCH_PROXY_KEY", "SEARCH_MODEL"),
+    "summary": ("SUMMARY_PROXY_URL", "SUMMARY_PROXY_KEY", "SUMMARY_MODEL"),
+    "reflection": ("REFLECTION_PROXY_URL", "REFLECTION_PROXY_KEY", "REFLECTION_MODEL"),
+    "rag": ("RAG_URL", "RAG_KEY", "RAG_MODEL"),
+}
+
+# Фолбеки: секция -> (url_key, key_key, model_key)
+FALLBACK_KEYS = {
+    "main": ("MAIN_FALLBACK_URL", "MAIN_FALLBACK_KEY", "MAIN_FALLBACK_MODEL"),
+    "search": ("SEARCH_FALLBACK_URL", "SEARCH_FALLBACK_KEY", "SEARCH_FALLBACK_MODEL"),
+    "summary": ("SUMMARY_FALLBACK_URL", "SUMMARY_FALLBACK_KEY", "SUMMARY_FALLBACK_MODEL"),
+    "reflection": ("REFLECTION_FALLBACK_URL", "REFLECTION_FALLBACK_KEY", "REFLECTION_FALLBACK_MODEL"),
+    "rag": ("RAG_FALLBACK_URL", "RAG_FALLBACK_KEY", "RAG_FALLBACK_MODEL"),
+}
+
+async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущие настройки LLM и кнопки для редактирования."""
+    if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+
+    buttons = []
+    for key, (name, _) in LLM_SECTIONS.items():
+        buttons.append([InlineKeyboardButton(name, callback_data=f"llm:{key}")])
+
+    markup = InlineKeyboardMarkup(buttons)
+    text = "⚙️ настройки LLM\n\nвыбери секцию для настройки:"
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на InlineKeyboard."""
+    query = update.callback_query
+    if not query or update.effective_user.id != config.ALLOWED_USER_ID:
+        return
+
+    data = query.data
+    await query.answer()
+
+    if data.startswith("llm:"):
+        section = data.split(":", 1)[1]
+        if section not in LLM_SECTIONS:
+            return
+
+        section_name, fields = LLM_SECTIONS[section]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+        fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+
+        # Текущие значения
+        current_url = getattr(config, url_key, "—")
+        current_model = getattr(config, model_key, "—")
+        current_fb_url = getattr(config, fb_url_key, "")
+        current_fb_model = getattr(config, fb_model_key, "")
+
+        # Определяем текущий провайдер
+        current_provider = "custom"
+        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+            if current_url == prov_url and current_model == prov_model:
+                current_provider = prov_name
+                break
+
+        current_fb_provider = "не настроен"
+        if current_fb_url:
+            for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+                if current_fb_url == prov_url and current_fb_model == prov_model:
+                    current_fb_provider = prov_name
+                    break
+            else:
+                current_fb_provider = "custom"
+
+        text = f"{section_name}\n\n"
+        text += f"**Основной:** `{current_provider.upper()}`\n"
+        text += f"URL: `{current_url}`\n"
+        text += f"Модель: `{current_model}`\n\n"
+        text += f"**Фолбек:** `{current_fb_provider}`\n"
+        if current_fb_url:
+            text += f"URL: `{current_fb_url}`\n"
+            text += f"Модель: `{current_fb_model}`\n"
+
+        buttons = [
+            [InlineKeyboardButton("⚡ Основной провайдер", callback_data=f"llm_main:{section}")],
+            [InlineKeyboardButton("🔁 Фолбек провайдер", callback_data=f"llm_fb:{section}")],
+            [InlineKeyboardButton("⬅️ назад", callback_data="llm_back")],
+        ]
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("llm_main:"):
+        section = data.split(":", 1)[1]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+        current_url = getattr(config, url_key, "—")
+        current_model = getattr(config, model_key, "—")
+
+        current_provider = "custom"
+        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+            if current_url == prov_url and current_model == prov_model:
+                current_provider = prov_name
+                break
+
+        text = f"{LLM_SECTIONS[section][0]} — основной\n\n"
+        text += f"URL: `{current_url}`\n"
+        text += f"Модель: `{current_model}`\n\n"
+        text += "выбери провайдер:\n"
+
+        buttons = []
+        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+            label = prov_name.upper()
+            if prov_name == current_provider:
+                label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"prov:{section}:{prov_name}")])
+
+        buttons.append([InlineKeyboardButton("✏️ Свой провайдер", callback_data=f"custom:{section}")])
+        buttons.append([InlineKeyboardButton("⬅️ назад", callback_data=f"llm:{section}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("llm_fb:"):
+        section = data.split(":", 1)[1]
+        fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+        current_fb_url = getattr(config, fb_url_key, "")
+        current_fb_model = getattr(config, fb_model_key, "")
+
+        current_fb_provider = "не настроен"
+        if current_fb_url:
+            for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+                if current_fb_url == prov_url and current_fb_model == prov_model:
+                    current_fb_provider = prov_name
+                    break
+            else:
+                current_fb_provider = "custom"
+
+        text = f"{LLM_SECTIONS[section][0]} — фолбек\n\n"
+        if current_fb_url:
+            text += f"URL: `{current_fb_url}`\n"
+            text += f"Модель: `{current_fb_model}`\n\n"
+        else:
+            text += "не настроен\n\n"
+        text += "выбери провайдер:\n"
+
+        buttons = []
+        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+            label = prov_name.upper()
+            if prov_name == current_fb_provider:
+                label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"fbprov:{section}:{prov_name}")])
+
+        buttons.append([InlineKeyboardButton("✏️ Свой провайдер", callback_data=f"fbcustom:{section}")])
+        if current_fb_url:
+            buttons.append([InlineKeyboardButton("🚫 Убрать фолбек", callback_data=f"fbdel:{section}")])
+        buttons.append([InlineKeyboardButton("⬅️ назад", callback_data=f"llm:{section}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("custom:"):
+        section = data.split(":", 1)[1]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+        await query.edit_message_text(
+            f"✏️ `{LLM_SECTIONS[section][0]}` — свой провайдер\n\n"
+            f"напиши через пробел:\n"
+            f"`URL модель ключ`\n\n"
+            f"примеры:\n"
+            f"`https://openrouter.ai/api/v1 google/gemini-2.5-flash sk-or-xxx`\n"
+            f"`http://127.0.0.1:8000 yandex-alice sk-alice`\n"
+            f"`gpt-4o` (только модель, URL останется прежним)",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing_env_key"] = section
+
+    elif data.startswith("prov:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        if prov_name not in PROVIDERS:
+            return
+
+        prov_url, prov_key, prov_model, prov_proxy = PROVIDERS[prov_name]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+
+        # Показываем модели провайдера
+        models = PROVIDER_MODELS.get(prov_name, [])
+        current_model = getattr(config, model_key, "—")
+
+        # Текущий прокси провайдера
+        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
+        current_proxy = getattr(config, proxy_env_key, "") if proxy_env_key else ""
+        proxy_status = f"`{current_proxy}`" if current_proxy else "нет"
+
+        text = f"{LLM_SECTIONS[section][0]} — {prov_name.upper()}\n\n"
+        text += f"URL: `{prov_url}`\n"
+        text += f"Прокси: {proxy_status}\n\n"
+        text += "выбери модель:\n"
+
+        buttons = []
+        # Всегда используем индексы для callback_data ( Telegram лимит 64 байта)
+        for i, (model_id, model_name) in enumerate(models):
+            label = model_name
+            if model_id == current_model:
+                label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"setmodel:{section}:{prov_name}:{i}")])
+
+        buttons.append([InlineKeyboardButton("✏️ Своя модель", callback_data=f"custommodel:{section}:{prov_name}")])
+        buttons.append([InlineKeyboardButton("🌐 Прокси", callback_data=f"proxy:{prov_name}")])
+        buttons.append([InlineKeyboardButton("⬅️ назад", callback_data=f"llm:{section}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("setmodel:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        model_id = parts[3]
+        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+
+        # Разрешаем индекс в model_id для всех провайдеров
+        if prov_name in PROVIDER_MODELS and model_id.isdigit():
+            idx = int(model_id)
+            models = PROVIDER_MODELS[prov_name]
+            if 0 <= idx < len(models):
+                model_id = models[idx][0]
+
+        updates = {url_key: prov_url, model_key: model_id}
+        # Ключ провайдера пишем в .env (у каждого свой)
+        if key_key and prov_key:
+            updates[key_key] = prov_key
+        _write_env(updates)
+
+        await query.edit_message_text(
+            f"✅ {LLM_SECTIONS[section][0]}\n{prov_name.upper()}: {model_id}\n\nперезапускаю...",
+        )
+        import subprocess
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    elif data.startswith("custommodel:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        url_key, key_key, model_key = SECTION_KEYS[section]
+
+        await query.edit_message_text(
+            f"✏️ `{prov_name.upper()}` — своя модель\n\n"
+            f"напиши модель и (опционально) ключ через пробел:\n"
+            f"`gemini-2.5-flash`\n"
+            f"`gpt-4o sk-or-xxx`",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing_env_key"] = section
+        context.user_data["editing_provider"] = prov_name
+
+    elif data.startswith("fbprov:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        if prov_name not in PROVIDERS:
+            return
+
+        prov_url, prov_key, prov_model, _prov_proxy = PROVIDERS[prov_name]
+        fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+
+        models = PROVIDER_MODELS.get(prov_name, [])
+        current_fb_model = getattr(config, fb_model_key, "")
+
+        text = f"{LLM_SECTIONS[section][0]} — фолбек {prov_name.upper()}\n\n"
+        text += f"URL: `{prov_url}`\n\n"
+        text += "выбери модель:\n"
+
+        buttons = []
+        # Всегда используем индексы для callback_data (Telegram лимит 64 байта)
+        for i, (model_id, model_name) in enumerate(models):
+            label = model_name
+            if model_id == current_fb_model:
+                label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"fbsetmodel:{section}:{prov_name}:{i}")])
+
+        buttons.append([InlineKeyboardButton("✏️ Своя модель", callback_data=f"fbcustommodel:{section}:{prov_name}")])
+        buttons.append([InlineKeyboardButton("⬅️ назад", callback_data=f"llm_fb:{section}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("fbcustom:"):
+        section = data.split(":", 1)[1]
+        await query.edit_message_text(
+            f"✏️ `{LLM_SECTIONS[section][0]}` — свой фолбек\n\n"
+            f"напиши через пробел:\n"
+            f"`URL модель ключ`\n\n"
+            f"примеры:\n"
+            f"`https://openrouter.ai/api/v1 google/gemini-2.5-flash sk-or-xxx`\n"
+            f"`http://127.0.0.1:8000 yandex-alice sk-alice`\n"
+            f"`gpt-4o` (только модель, URL останется прежним)",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing_env_key"] = f"fb_{section}"
+
+    elif data.startswith("fbdel:"):
+        section = data.split(":", 1)[1]
+        fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+        _write_env({fb_url_key: "", fb_key_key: "", fb_model_key: ""})
+        await query.edit_message_text(
+            f"🚫 Фолбек для {LLM_SECTIONS[section][0]} убран\n\nперезапускаю...",
+        )
+        import subprocess
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    elif data.startswith("fbsetmodel:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        model_id = parts[3]
+        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
+
+        # Разрешаем индекс в model_id для всех провайдеров
+        if prov_name in PROVIDER_MODELS and model_id.isdigit():
+            idx = int(model_id)
+            models = PROVIDER_MODELS[prov_name]
+            if 0 <= idx < len(models):
+                model_id = models[idx][0]
+
+        updates = {fb_url_key: prov_url, fb_model_key: model_id}
+        # Ключ провайдера пишем в .env (у каждого свой)
+        if fb_key_key and prov_key:
+            updates[fb_key_key] = prov_key
+        _write_env(updates)
+
+        await query.edit_message_text(
+            f"✅ {LLM_SECTIONS[section][0]} — фолбек\n{prov_name.upper()}: {model_id}\n\nперезапускаю...",
+        )
+        import subprocess
+        subprocess.Popen(
+            ["systemctl", "restart", "tg-bot.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    elif data.startswith("fbcustommodel:"):
+        parts = data.split(":")
+        section = parts[1]
+        prov_name = parts[2]
+        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+
+        await query.edit_message_text(
+            f"✏️ `{prov_name.upper()}` — своя модель (фолбек)\n\n"
+            f"напиши модель и (опционально) ключ через пробел:\n"
+            f"`gemini-2.5-flash`\n"
+            f"`gpt-4o sk-or-xxx`",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing_env_key"] = f"fb_{section}"
+        context.user_data["editing_provider"] = prov_name
+
+    elif data.startswith("llm_edit:"):
+        config_key = data.split(":", 1)[1]
+        current = str(getattr(config, config_key, ""))
+        await query.edit_message_text(
+            f"✏️ `{config_key}`\n\nтекущее: `{current}`\n\n"
+            f"напиши новое значение:",
+            parse_mode="Markdown",
+        )
+        context.user_data["editing_env_key"] = config_key
+
+    elif data == "llm_back":
+        buttons = []
+        for key, (name, _) in LLM_SECTIONS.items():
+            buttons.append([InlineKeyboardButton(name, callback_data=f"llm:{key}")])
+        markup = InlineKeyboardMarkup(buttons)
+
+        text = "⚙️ настройки LLM\n\n"
+        for key, (name, _) in LLM_SECTIONS.items():
+            url_key, _, model_key = SECTION_KEYS[key]
+            fb_url_key, _, fb_model_key = FALLBACK_KEYS[key]
+
+            current_url = getattr(config, url_key, "")
+            current_model = getattr(config, model_key, "")
+            current_fb_url = getattr(config, fb_url_key, "")
+
+            # Определяем имя провайдера
+            provider_name = "custom"
+            for pn, (pu, _, pm, __) in PROVIDERS.items():
+                if current_url == pu and current_model == pm:
+                    provider_name = pn
+                    break
+
+            fb_name = "выкл"
+            if current_fb_url:
+                fb_name = "custom"
+                for pn, (pu, _, pm, __) in PROVIDERS.items():
+                    if current_fb_url == pu and getattr(config, fb_model_key, "") == pm:
+                        fb_name = pn
+                        break
+
+            text += f"{name}\n"
+            text += f"  ⚡ {provider_name.upper()}: `{current_model}`\n"
+            text += f"  🔁 фолбек: {fb_name}\n"
+
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    # --- УПРАВЛЕНИЕ ПРОКСИ ---
+    elif data.startswith("proxy:"):
+        prov_name = data.split(":", 1)[1]
+        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
+        if not proxy_env_key:
+            return
+        current_proxy = getattr(config, proxy_env_key, "")
+
+        # Загружаем сохранённые прокси
+        try:
+            with open("/root/tg_bot/saved_proxies.json", "r") as f:
+                saved = json.load(f)
+        except Exception:
+            saved = []
+
+        text = f"🌐 Прокси для {prov_name.upper()}\n\n"
+        text += f"текущий: `{current_proxy if current_proxy else 'нет'}`\n\n"
+        text += "выбери или введи свой:\n"
+
+        buttons = []
+        buttons.append([InlineKeyboardButton("🚫 Без прокси", callback_data=f"proxyset:{prov_name}:none")])
+        for i, sp in enumerate(saved):
+            label = f"{sp['name']} ({sp['host']}:{sp['port']})"
+            if current_proxy and sp['host'] in current_proxy:
+                label = f"✅ {label}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"proxyset:{prov_name}:saved:{i}")])
+        buttons.append([InlineKeyboardButton("✏️ Свой прокси", callback_data=f"proxyset:{prov_name}:custom")])
+        buttons.append([InlineKeyboardButton("⬅️ назад", callback_data=f"proxyback:{prov_name}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    elif data.startswith("proxyset:"):
+        parts = data.split(":")
+        prov_name = parts[1]
+        mode = parts[2]
+        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
+        if not proxy_env_key:
+            return
+
+        # Сервисы которые нужно перезапускать при смене прокси
+        PROXY_SERVICES = {
+            "gpt": ["chatgpt-fallback"],
+            "gemini": ["gemini-web2api"],
+            "deepseek": ["freedeepseek-api"],
+            "openrouter": ["tg-bot"],
+            "g4f": ["tg-bot"],
+            "alice": ["tg-bot"],
+        }
+
+        def _restart_services(prov):
+            import subprocess
+            services = PROXY_SERVICES.get(prov, ["tg-bot"])
+            for svc in services:
+                subprocess.Popen(
+                    ["systemctl", "restart", f"{svc}.service"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+
+        if mode == "none":
+            _write_env({proxy_env_key: ""})
+            await query.edit_message_text(
+                f"🚫 Прокси для {prov_name.upper()} убран\n\nперезапускаю...",
+            )
+            _restart_services(prov_name)
+
+        elif mode == "saved":
+            idx = int(parts[3])
+            try:
+                with open("/root/tg_bot/saved_proxies.json", "r") as f:
+                    saved = json.load(f)
+                sp = saved[idx]
+                proxy_str = f"{sp['host']}:{sp['port']}:{sp['user']}:{sp['pass']}"
+                _write_env({proxy_env_key: proxy_str})
+                await query.edit_message_text(
+                    f"✅ Прокси для {prov_name.upper()}: `{sp['host']}:{sp['port']}`\n\nперезапускаю...",
+                    parse_mode="Markdown",
+                )
+                _restart_services(prov_name)
+            except Exception as e:
+                await query.edit_message_text(f"❌ Ошибка: {e}")
+
+        elif mode == "custom":
+            await query.edit_message_text(
+                f"✏️ `{prov_name.upper()}` — свой прокси\n\n"
+                f"напиши в формате:\n"
+                f"`host:port:user:pass`\n\n"
+                f"пример:\n"
+                f"`170.83.236.245:8000:15Uo6V:3HF2Fh`",
+                parse_mode="Markdown",
+            )
+            context.user_data["editing_proxy"] = prov_name
+
+    elif data.startswith("proxyback:"):
+        prov_name = data.split(":", 1)[1]
+        # Возвращаемся к списку провайдеров секции
+        for section, (url_key, _, _) in SECTION_KEYS.items():
+            url_val = getattr(config, url_key, "")
+            for pn, (pu, _, _, _) in PROVIDERS.items():
+                if pn == prov_name and url_val == pu:
+                    # Имитируем callback "prov:section:prov_name"
+                    query._data = f"prov:{section}:{prov_name}"
+                    await handle_callback(query, context)
+                    return
+        # Фолбек — на главную
+        buttons = []
+        for key, (name, _) in LLM_SECTIONS.items():
+            buttons.append([InlineKeyboardButton(name, callback_data=f"llm:{key}")])
+        markup = InlineKeyboardMarkup(buttons)
+        await query.edit_message_text("⚙️ настройки LLM", reply_markup=markup)
