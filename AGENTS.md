@@ -1,0 +1,74 @@
+# Проект tg_bot (Telegram-бот-ассистент «Призрак»)
+
+Запускать opencode из этой папки: `cd /root/tg_bot && opencode` — чтобы этот AGENTS.md подхватился.
+
+- Папка: `/root/tg_bot/`, systemd-сервис: `tg-bot.service`. Рестартовать ТОЛЬКО `tg-bot.service` (после правки: `systemctl restart tg-bot.service`, затем `systemctl is-active`).
+- Git: push только по явной команде; ключ `/root/.ssh/tg_bot_deploy` (`GIT_SSH_COMMAND="ssh -i /root/.ssh/tg_bot_deploy" git push`). НЕ пушить `.env.bak*`, `rag_storage`, `-shm`/`-wal`.
+- После правки Python всегда: `python3 -m py_compile файл.py`, затем рестарт сервиса и проверка `systemctl is-active` + журнал.
+
+### Генерация и фолбеки (иерархия провайдеров, 2026-08-30)
+- **Основная генерация**: `gemini-web2api.service` → OpenAI-совместимый на `127.0.0.1:4984`, модель `gemini-3.6-flash` (куки-скрапер gemini.google.com через `cookies.txt` + `cookie_autorefresh.py`). При бане аккаунта/куки — умирает. Запускается через `/root/tg_bot/start_gemini.sh` (`exec python3 -u gemini_web2api.py`, WorkingDirectory=/root/gemini-web2api; НЕ node server.js — это Python-проект, был сломан 2026-09-01 неверным скриптом). Прокси из `PROXY_GEMINI` в .env, куки в `cookies.txt`.
+- **Фолбек генерации**: `safe_generate_content` (bot_ai.py) при 3 провалах web2api → через **g4f.space** (API `/api/gemini`, чужие аккаунты, без своего логина): `MAIN_FALLBACK_URL=https://g4f.space/api/gemini`, `MAIN_FALLBACK_MODEL=models/gemini-flash-latest`, кредиты привязаны к IP прокси. Ретраи при 429/сбоях. **ВАЖНО: g4f.space ОТВЕРГАЕТ `sk-` ключи** (HTTP 400 "Please pass a valid API key") — принимает пусто/`anon`; `MAIN_FALLBACK_KEY`/`SEARCH_FALLBACK_KEY`/`SUMMARY_FALLBACK_KEY`/`REFLECTION_FALLBACK_KEY` должны быть ПУСТЫМИ (или anon), иначе фолбек падает. (Баг 2026-09-01: MAIN_FALLBACK_KEY="sk-gemini" → все фолбеки 400.)
+- **Бейкер PoW**: `tg-cake-baker.service` → `/root/tg_bot/cake_baker.py` — печёт proof-of-work "cakes" для g4f.space (SHA-256 подбор нонса, difficulty 24), 1 cake = 5¢, лимит 100 cakes/день по IP, ~$5/день ≈ ~500 запросов на g3.5-flash. Печёт через `PROXY_G4F` (прокси `168.196.238.152:9260` — там же копятся кредиты). `Nice=10`, без порта, `Restart=on-failure`. Кредиты НЕ сгорают в полночь (обнуляется только счётчик `baked_today`).
+- **Саммари/рефлексия**: Алиса (`alice-api.service`, 127.0.0.1:8000, `yandex-alice`) → фолбек ChatGPT (`chatgpt-fallback.service`, 127.0.0.1:5040, `_summary_fallback`). Актуальные секции в `.env` сейчас: SUMMARY/REFLECTION = `127.0.0.1:5040` (chatgpt/anon), их фолбеки = g4f.space без ключа.
+- **Поиск**: `freedeepseek-api.service` (127.0.0.1:9655, `deepseek-chat`, `search:true`, `user: tg_bot_search`). Фолбек `search_web_g4f()` (bot_ai.py) через **g4f.space `/api/Gemini`** (реальный gemini.google.com на чужих аккаунтах) с `web_search=True`, кредиты через `PROXY_G4F` (тот же IP, что у бейкера). Старый фолбек `perplexity_search` — **мёртв** (HTTP 200, но в SSE нет `answer`-блоков → всегда `None`), удалён из пути поиска. Примечание: Gemini может давать НЕТОЧНЫЕ/выдуманные URL, когда просят одну прямую ссылку — годится как запасной, не основной.
+- Переменные в `config.py`/`.env`: `G4F_URL/KEY/MODEL` (основная генерация), `SEARCH_PROXY_URL/KEY` + `SEARCH_MODEL`, `SUMMARY_*`, `REFLECTION_*`, `RAG_URL/KEY/MODEL`, `PROXY_OPENROUTER/G4F/GEMINI/ALICE/DEEPSEEK/GPT`. **Прокси вешается ТОЛЬКО на провайдера** (`PROXY_*`), не на секцию — в секциях меню /models прокси нет. Легаси `G4F_PROXY` (дубль `PROXY_G4F`) УДАЛЁН (2026-09-01) из config.py/.env/всех использующих файлов. Прокси в env системных сервисов задаются обёртками `start_*.sh`, `https_proxy` в нижнем регистре (Playwright его не видит, urllib — да; для g4f прокси задаётся явно через `PROXY_G4F`).
+
+### Ключевые файлы
+- `bot_ai.py` — генерация ответов моделью: `safe_generate_content` (:63), `_g4f_urlopen` (g4f-транспорт, `proxy` параметр; localhost/127.0.0.1 ВСЕГДА идёт напрямую без прокси — центральная защита от «прокси-сюрпризов»), `_chat_completion` (бывш. `safe_generate_deepseek`, универсальный OpenAI-запрос, лог `[tag:model]`), `attempt_for_repair_json` (repair JSON) (:286), `process_user_input` (:437) — в нём лог `📥 [GEMINI]` (+ запись промпта в `last_gemini_prompt.txt`). `safe_generate_content` печатает лог Gemini одной строкой.
+- `search_web` + `search_web_g4f` (bot_ai.py) — поиск: DeepSeek (9655, основной) → g4f `/api/Gemini` web_search (фолбек). `_g4f_search_cleanup` — чистка g4f-ответов: авто-цитаты `[[N]](url)/[[N]]([url](url)`, markdown-дубли `[url](url)`, склейка черновик+финал; блок источников `> [N]` сохраняется. DeepSeek-ответ чистится от `[citation:N]`. g4f-промпт: «возьми URL из источника, не придумывай».
+- `cake_baker.py` — демон PoW-бейкинга для g4f.space (копит кредиты на IP прокси). Логи через `logger = logging.getLogger("cake_baker")`, смотрим `journalctl -u tg-cake-baker.service`.
+- `bot_handlers.py` — обработчики сообщений, `_send_acks` (:82, шлёт ВСЕ ack-реплики при tool_call/команде/поиске), `_send_md` (:56, логирует `💡<-` при успешной отправке), `_tool_loop` (дубли тулов :233-243), лог `[SERVER] ✅` (:321), финал :437. **`handle_file`** — приём файлов (документы/фото/аудио/видео): оригинальное имя из Telegram (коллизия → `name_YYYYMMDD_HHMMSS.ext`), фото берёт `photo[-1]` (макс. разрешение), сохраняет в `workspace/incoming/`, в историю — `[файл]: путь`, прогоняет через обычный конвейер (модель «знает», но не обрабатывает сама). Лог `📄-> Файл сохранён`. Голосовые/кружки — отдельный `handle_voice`. **`/models`** — меню LLM: `LLM_SECTIONS` (секции main/search/summary/reflection/rag), `SECTION_KEYS` (url/key/model), `FALLBACK_KEYS`, `PROVIDERS` (4-кортежи url/key/model/proxy), `PROVIDER_MODELS`, `_load_openrouter_free_models`. Выбор провайдера/модели пишет в `.env` и рестартит tg-bot.
+- `rag.py` — память (memorylite sqlite в `rag_storage/`): сначала `insert_to_rag`/`query_rag` (2026-09-01), затем новая схема (2026-09-02): **запись пакетная** `remember_window(messages)` (вызывается из `update_longterm_summary` при триггере саммари, извлекает факты из всего окна последних `config.CHAT_HISTORY_LIMIT` сообщений, фильтр `importance >= 0.55`, пишет через `persist_extraction`), **чтение через LLM** `format_memory_answer(query, raw_fragments)` — после `query_rag` (SQLite FTS) берёт сырые фрагменты, RAG_MODEL формирует ответ для бота («Тебя зовут …», «Пользователь сказал …»). Фолбек: RAG основной → `RAG_FALLBACK_URL/KEY/MODEL` (через `providers`), после неудач возвращает сырые фрагменты. Логи: `🧠 [MEMORY:ПРОВАЙДЕР] НАШЁЛ: …`. По-сообщённый `insert_to_rag` УДАЛЁН (мусорная запись), его импорты убраны из bot_handlers/bot_ai. `FreshSessionJSONClient` (свежая сессия на каждый вызов + `_delete_session`). **Читает `config.RAG_URL/KEY/MODEL`** (из .env или /models), а НЕ хардкод — раньше был захардкожен DeepSeek 9655. `_delete_session` срабатывает ТОЛЬКО на freedeepseek-api (127.0.0.1:9655) — у остальных провайдеров (GPT/Gemini/g4f и т.п.) нет `/session`, для них пропускается. Настройка RAG вынесена в `/models` (секция «🧠 RAG (память)», 2026-09-01). Модель: OpenRouter `minimax/minimax-m3:free`. Monkeypatch'и: `_search_terms` (кириллица) и `extract_memories` (нормализация фактов; `remember_window` использует `_WINDOW_EXTRACTION_PROMPT`, окно-специфичный, а не промпт одиночного сообщения).
+- `tools_registry.py` — регистрация/парсинг тулов, `_parse_value`/`_unescape_literals` (разэкранирование `\n`).
+- `server_access.py` — исполнение кастомных тулов, логгер через `logging.getLogger(__name__)` (:17).
+- `workspace/tools/` — кастомные тулы: `todo_tool.py`, `file_tool.py`, `template_tool.py` (шаблон обязателен к прочтению перед созданием нового тула).
+- `prompt_template.txt` — системный промт. «ВАЖНО ПРО НАМЕРЕНИЯ» (:52): «Когда запускаешь tool_call — коротко и по существу комментируй, что именно делаешь» (упрощено 2026-08-30, до этого было правило про «щас гляну»). «ВАЖНО, НЕ ДУБЛИРУЙ» (:58): не повторять дословно своё из <HISTORY>.
+- `main.py`, `_tool_runner.py`, `state.json`, `config.py` — рантайм/логирование/настройки (`TOOL_RESULT_LIMIT=250`, `FALLBACK_PHRASES` :71). `config.py` — `CHAT_HISTORY_LIMIT=50` (лимит истории для модели + триггер саммари), `SEARCH_PROXY_URL/KEY` (дефолты Alice 127.0.0.1:8000), `SUMMARY_*` (дефолты = SEARCH_*), `RAG_*`, `PROXY_*`. `_read_env`/`_write_env` в bot_handlers.py — чтение/перезапись `.env` (сохраняет порядок, добавляет новые в конец).
+
+### Логи (порядок в журнале)
+- `📥 [GEMINI] {len(prompt)} → {len(raw)} симв {parsed_json}` — печатается в `process_user_input` при ответе модели (сейчас ДО `💡<-`).
+- `💡<- текст` — `_send_md`, при успешной отправке сообщения пользователю (сейчас печатается ПОСЛЕ `📥 [GEMINI]`).
+- `🔧 [TOOL] {call_str}` и `✅🔧 [RESULT] {out_block}` — лог тулов. `✅🔧 [RESULT]` показывает ровно тот `out_block`, что попадает в `<MEMORY_CONTEXT>` промта (сжатый или нет), без дубля `call_str`.
+- `🖥️ [SERVER] ✅ {server_cmd} → {report}` — вывод/выжимка серверной команды.
+
+### ЗАДАЧА: чтение картинок через тул file.read (2026-08-31)
+
+**Суть задачи:** сделать так, чтобы когда бот вызывает тул `file.read` на картинке (jpg/png/webp и т.п.), чтение "работало нормально" — тот же механизм, что при реальной отправке фото: картинка уходит вместе с промптом в g4f.space, и модель видит и картинку, и весь контекст, и отвечает сама от имени бота.
+
+**Контекст, который уже есть:**
+- **Отправка фото работает**: `handle_file` (bot_handlers.py) сохраняет фото в `workspace/incoming/`, пишет в историю `[файл]: <путь>`, зовёт `process_user_input(f"[файл]: {candidate}")`. В `process_user_input` детектор (bot_ai.py:819-825) ловит `[файл]: *.jpg` и ставит `image_path` → `safe_generate_content` уходит **сразу в g4f** с `content=[text + image_url(base64)]`. Свой Gemini-аккаунт (`gemini-web2api`) картинки **НЕ принимает** (BardErrorInfo 1100, image input запрещён на аккаунте) — поэтому для картинок всегда g4f.space (проверено, работает, вернул "Борщ").
+- **НЕПРАВИЛЬНОЕ решение (отвергнуто владельцем)**: возвращать из `file.read` текстовое описание картинки в `<RESULT>`. Владелец явно сказал: "тул возвращает описание картинки" и "когда file.read читает картинку, запрос уходил с картинкой на g4f" — это РАЗНЫЕ вещи. Нужно, чтобы модель сама видела картинку в основном запросе, а не получала готовое описание.
+- **НЕПРАВИЛЬНОЕ решение (отвергнуто)**: вставлять base64-строку как обычный текст в промпт/`<RESULT>`. Владелец понял и подтвердил: base64 как текст в промпте = модель НЕ увидит картинку. base64 обязан попасть в `{"type":"image_url","image_url":{"url":"data:...;base64,...."}}` внутри `content` — только тогда g4f декодирует пиксели. (То есть "base64 — это текст" и "base64 должен быть в image input" — не противоречат: base64 это текст-представление, но модели его надо подать в image_url-блок, а не как строку в контексте.)
+
+**Архитектурные факты, важные для решения:**
+- Тул `file.read` исполняется в **отдельном subprocess** через `_tool_runner.py` (`server_access.execute_custom_tool`, server_access.py:272), **не в конвейере `bot_ai.py`**. Поэтому из тула напрямую в основной g4f-запрос бота нельзя залезть.
+- RESULT тула попадает в `tool_context` → передаётся в `process_user_input(memory_context=tool_context)` (bot_handlers.py:305-308) и записывается в историю `add_tool_record` (bot_handlers.py:303) как `🔧 вызвал: ... → ...`.
+- Основной запрос к g4f собирается в `process_user_input`/`safe_generate_content`: модель видит картинку только если `image_path` найден и добавлен `image_url`-блок.
+- `process_user_input` собирает `prompt` из `user_text` (вход пользователя) + `history` (вся история) + блоки. Детектор картинки сейчас ищет **только в `user_text`** (bot_ai.py:819-825), НЕ в `history`/`memory_context` — поэтому при `file.read` (где путь приходит в `tool_context`, а не в `user_text`) детектор не срабатывает.
+
+**Требуемое поведение:**
+- Когда модель вызывает `file.read(path=картинка)` — то же самое, как если бы пользователь прислал фото: картинка прикрепляется к **следующему/текущему** g4f-запросу как `image_url`-base64, модель видит её вместе со всем контекстом и отвечает сама от имени бота. Никаких текстовых описаний в `<RESULT>` как подмены "зрения".
+
+**Какой путь** — решено НЕ фиксировать; решение за владельцем/будущим агентом. Возможные направления (не являются решением):
+- Привести путь картинки от `file.read` к тому же формату `[файл]: <путь>`, что и при отправке фото, и чтобы `process_user_input` находил его не только в `user_text`, но и в `memory_context`/`history`.
+- Проверить, как `safe_generate_content`/`_read_image_b64` резолвят путь (абсолютный vs workspace-относительный), чтобы `file.read` вернул корректный путь.
+
+**НЕ делать без явной команды владельца:** править код, откатывать, коммитить, пушить. Сначала предложить решение и дождаться "делай".
+
+### ЗАДАЧА: поддержка других бинарных форматов в file.read (отложено)
+
+**Суть:** расширить `file.read` так, чтобы он работал не только с картинками, но и с другими бинарными форматами:
+- **PDF** — извлечь текст (первую страницу) или вернуть метаданные (количество страниц, размер)
+- **Аудио** (mp3, ogg, wav) — вернуть метаданные (длительность, битрейт, формат)
+- **Видео** (mp4, avi, mkv) — вернуть метаданные (длительность, разрешение, кодек)
+
+**Контекст:** `file.read` сейчас обрабатывает только текстовые файлы и картинки (jpg/png/webp/gif/bmp). Для остальных бинарных файлов пытается декодировать как UTF-8 → гиблый текст.
+
+**Приоритет:** низкий. Сначала картинки (✅ сделано), потом по необходимости.
+
+### Заметки/правила владельца
+- **Модель и так понимает промт** — не перегружай промт кучей жёстких правил про «щас/повторы»: если просит «просто написать что-то», пиши одну короткую фразу, а не абзац.
+- Дубли «щас сделаю» перед несколькими тулами подряд — поведение модели, а не механика кода. Лечится короткой инструкцией в промте: «комментируй, что именно делаешь», НЕ абзацем-запретом.
+- **Полный промт в Gemini** каждый раз перезаписывается в `/root/tg_bot/last_gemini_prompt.txt` (для отладки, что реально уходит в модель).
+- **НЕ начинать править код без явной команды.** Даже если владелец объясняет проблему и хочет решения — сначала предложи, дождись «делай», только потом правь. Изначально владелец хотел переставить `💡<-` выше `📥 [GEMINI]` (перенос печати лога из `process_user_input` в точки отправки), но правка была начата без команды и откачена — код остался в исходном виде.

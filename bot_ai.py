@@ -250,9 +250,11 @@ async def _try_generate(url, key, model, prompt, temperature, image_path, provid
 
 
 async def safe_generate_content(prompt, temperature=0.85, image_path=None):
-    """Генерация с фолбеком: основной провайдер → MAIN_FALLBACK."""
+    """Генерация с фолбеком: основной провайдер → MAIN_FALLBACK.
+    Возвращает (text, provider_name) — имя реально сработавшего провайдера,
+    чтобы лог не врал про источник ответа."""
     if is_stopped():
-        return None
+        return None, None
     provider = providers.get_provider_name(providers.MAIN_URL)
     # Определяем прокси по URL провайдера
     proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
@@ -262,7 +264,7 @@ async def safe_generate_content(prompt, temperature=0.85, image_path=None):
         prompt, temperature, image_path, provider, attempt_limit=4, proxy=proxy
     )
     if result:
-        return result
+        return result, provider
 
     # Фолбек
     if providers.MAIN_FALLBACK_URL:
@@ -275,10 +277,10 @@ async def safe_generate_content(prompt, temperature=0.85, image_path=None):
             prompt, temperature, image_path, fb, attempt_limit=2, proxy=fb_proxy
         )
         if result:
-            return result
+            return result, fb
 
     logger.error(f"❌ Все провайдеры недоступны ({provider} + фолбек)")
-    return None
+    return None, provider
 
 async def _chat_completion(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_chat", session_type=None):
     """Универсальный OpenAI-совместимый запрос (используется для рефлексии/выжимок)."""
@@ -1124,10 +1126,9 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
             if os.path.splitext(cand)[1].lower() in IMAGE_EXTS and os.path.isfile(cand):
                 image_path = cand
 
-    raw_text = await safe_generate_content(prompt, image_path=image_path)
+    raw_text, used_provider = await safe_generate_content(prompt, image_path=image_path)
     parsed_json = await try_parse_or_repair_json(raw_text)
     
     if parsed_json:
-        provider = providers.get_provider_name(providers.G4F_URL)
-        logger.info(f"📥 [{provider}] {len(prompt)} → {len(raw_text or '')} симв {parsed_json}")
+        logger.info(f"📥 [{used_provider or '?'}] {len(prompt)} → {len(raw_text or '')} симв {parsed_json}")
     return parsed_json

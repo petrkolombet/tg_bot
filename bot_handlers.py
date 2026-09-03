@@ -31,12 +31,33 @@ async def _typing_loop(bot, user_id, stop_event):
 
 def _flatten_replies(replies):
     """Разворачивает replies любой вложенности в плоский список строк.
-    Модель иногда присылает [['a','b','c']] вместо ['a','b','c'] — разбираем штатно."""
+    Модель иногда присылает [['a','b','c']] вместо ['a','b','c'] — разбираем штатно.
+    Также разворачиваем строку, целиком являющуюся JSON с «replies»/«text»
+    (модель иногда двойным вложением заворачивает свой массив ответов в строку)."""
     out = []
     def walk(item):
         if isinstance(item, str):
-            if item.strip():
-                out.append(item)
+            s = item.strip()
+            if not s:
+                return
+            if s.startswith("{") or s.startswith("["):
+                try:
+                    obj = json.loads(s)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                else:
+                    if isinstance(obj, dict) and isinstance(obj.get("replies"), list):
+                        for x in obj["replies"]:
+                            walk(x)
+                        return
+                    if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                        walk(obj["text"])
+                        return
+                    if isinstance(obj, list):
+                        for x in obj:
+                            walk(x)
+                        return
+            out.append(item)
         elif isinstance(item, dict):
             t = item.get("text")
             if isinstance(t, str) and t.strip():
@@ -293,7 +314,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                 "которые уже видишь в истории. Напиши новый ответ."
             )
             decision = await process_user_input(
-                user_text, state_manager, memory_context=forced
+                "", state_manager, memory_context=forced
             )
             continue
 
@@ -305,7 +326,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                 "инструмент или просто ответь текстом."
             )
             decision = await process_user_input(
-                user_text, state_manager, memory_context=blocked_result
+                "", state_manager, memory_context=blocked_result
             )
             continue
 
@@ -322,7 +343,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                     "Проверь имя инструмента, метод и обязательные аргументы по каталогу. "
                     "Либо ответь пользователю текстом, либо исправь вызов."
                 )
-                decision = await process_user_input(user_text, state_manager, memory_context=bad)
+                decision = await process_user_input("", state_manager, memory_context=bad)
                 continue
 
             ack_replies = _flatten_replies(decision.get("replies"))
@@ -340,7 +361,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                 else:
                     logger.warning(f"⚠️ [TOOLS] Неизвестный встроенный метод {tool_name}.{method}")
                     decision = await process_user_input(
-                        user_text, state_manager,
+                        "", state_manager,
                         memory_context=f"⚠️ Инструмент '{tool_name}.{method}' неизвестен. Используй методы из каталога.",
                     )
                 continue
@@ -384,7 +405,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             tool_context = f"Результат вызова тула '{call_str}':\n---\n{out_block}\n---"
             if error:
                 tool_context += f"\nОшибки stderr:\n{error}"
-            decision = await process_user_input(user_text, state_manager, memory_context=tool_context, image_path=image_path)
+            decision = await process_user_input("", state_manager, memory_context=tool_context, image_path=image_path)
 
         elif decision.get("server_command"):
             server_spec = decision["server_command"]
@@ -412,7 +433,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             await state_manager.add_tool_record(rec)
 
             decision = await process_user_input(
-                user_text, state_manager, memory_context=server_context
+                "", state_manager, memory_context=server_context
             )
 
         elif decision.get("google_search"):
@@ -429,7 +450,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                     search_report += f"\n... (всего {len(search_result)} симв.)"
                 await state_manager.add_tool_record(f'🌐 искал: "{search_query}" → {search_report}')
                 search_context = f"Результат поиска по запросу '{search_query}':\n---\n{search_result}\n---"
-                decision = await process_user_input(user_text, state_manager, memory_context=search_context)
+                decision = await process_user_input("", state_manager, memory_context=search_context)
             else:
                 await state_manager.add_tool_record(f'🌐 искал: "{search_query}" (ничего не нашёл)')
                 empty_search = (
@@ -437,7 +458,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                     "Честно скажи пользователю, что найти не удалось, и предложи что-то другое. "
                     "Новых инструментов не запускай."
                 )
-                decision = await process_user_input(user_text, state_manager, memory_context=empty_search)
+                decision = await process_user_input("", state_manager, memory_context=empty_search)
 
         elif decision.get("memory_query_topic"):
             memory_topic = decision["memory_query_topic"]
@@ -464,7 +485,7 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
                     f"⚠️ Инструмент будильника неуспешен: {alarm_context} "
                     "Честно скажи пользователю, что выполнить не удалось. Новых инструментов не запускай."
                 )
-            decision = await process_user_input(user_text, state_manager, memory_context=followup)
+            decision = await process_user_input("", state_manager, memory_context=followup)
 
     return decision
 
@@ -495,7 +516,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prov_name = context.user_data.pop("editing_provider", None)
 
             if prov_name and prov_name in PROVIDERS:
-                prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+                prov_url, prov_key, _ = PROVIDERS[prov_name]
                 updates = {fb_url_key: prov_url, fb_model_key: parts[0]}
                 if len(parts) == 2:
                     updates[fb_key_key] = parts[1]
@@ -519,8 +540,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     model = parts[0]
                     found = False
-                    for pn, (pu, pk, pm, pp) in PROVIDERS.items():
-                        if model == pm:
+                    for pn, (pu, pk, _) in PROVIDERS.items():
+                        if model in [m[0] for m in PROVIDER_MODELS.get(pn, [])]:
                             _write_env({fb_url_key: pu, fb_model_key: model})
                             if fb_key_key and pk:
                                 _write_env({fb_key_key: pk})
@@ -540,7 +561,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prov_name = context.user_data.pop("editing_provider", None)
 
             if prov_name and prov_name in PROVIDERS:
-                prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+                prov_url, prov_key, _ = PROVIDERS[prov_name]
                 updates = {url_key: prov_url, model_key: parts[0]}
                 if len(parts) == 2:
                     updates[key_key] = parts[1]
@@ -564,8 +585,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     model = parts[0]
                     found = False
-                    for pn, (pu, pk, pm, pp) in PROVIDERS.items():
-                        if model == pm:
+                    for pn, (pu, pk, _) in PROVIDERS.items():
+                        if model in [m[0] for m in PROVIDER_MODELS.get(pn, [])]:
                             _write_env({url_key: pu, model_key: model})
                             if key_key and pk:
                                 _write_env({key_key: pk})
@@ -1248,17 +1269,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_fb_url = getattr(providers, fb_url_key, "")
         current_fb_model = getattr(providers, fb_model_key, "")
 
-        # Определяем текущий провайдер
+        # Определяем текущий провайдер (уникальный URL определяет провайдера)
         current_provider = "custom"
-        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
-            if current_url == prov_url and current_model == prov_model:
+        for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
+            if current_url == prov_url:
                 current_provider = prov_name
                 break
 
         current_fb_provider = "не настроен"
         if current_fb_url:
-            for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
-                if current_fb_url == prov_url and current_fb_model == prov_model:
+            for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
+                if current_fb_url == prov_url:
                     current_fb_provider = prov_name
                     break
             else:
@@ -1288,8 +1309,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_model = getattr(providers, model_key, "—")
 
         current_provider = "custom"
-        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
-            if current_url == prov_url and current_model == prov_model:
+        for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
+            if current_url == prov_url:
                 current_provider = prov_name
                 break
 
@@ -1299,7 +1320,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "выбери провайдер:\n"
 
         buttons = []
-        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+        for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
             label = prov_name.upper()
             if prov_name == current_provider:
                 label = f"✅ {label}"
@@ -1318,8 +1339,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         current_fb_provider = "не настроен"
         if current_fb_url:
-            for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
-                if current_fb_url == prov_url and current_fb_model == prov_model:
+            for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
+                if current_fb_url == prov_url:
                     current_fb_provider = prov_name
                     break
             else:
@@ -1334,7 +1355,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "выбери провайдер:\n"
 
         buttons = []
-        for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
+        for prov_name, (prov_url, prov_key, _prov_proxy) in PROVIDERS.items():
             label = prov_name.upper()
             if prov_name == current_fb_provider:
                 label = f"✅ {label}"
@@ -1369,7 +1390,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if prov_name not in PROVIDERS:
             return
 
-        prov_url, prov_key, prov_model, prov_proxy = PROVIDERS[prov_name]
+        prov_url, prov_key, prov_proxy = PROVIDERS[prov_name]
         url_key, key_key, model_key = SECTION_KEYS[section]
 
         # Показываем модели провайдера
@@ -1405,7 +1426,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         section = parts[1]
         prov_name = parts[2]
         model_id = parts[3]
-        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        prov_url, prov_key, _ = PROVIDERS[prov_name]
         url_key, key_key, model_key = SECTION_KEYS[section]
 
         # Разрешаем индекс в model_id для всех провайдеров
@@ -1434,7 +1455,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         section = parts[1]
         prov_name = parts[2]
-        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        prov_url, prov_key, _ = PROVIDERS[prov_name]
         url_key, key_key, model_key = SECTION_KEYS[section]
 
         await query.edit_message_text(
@@ -1454,7 +1475,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if prov_name not in PROVIDERS:
             return
 
-        prov_url, prov_key, prov_model, _prov_proxy = PROVIDERS[prov_name]
+        prov_url, prov_key, _ = PROVIDERS[prov_name]
         fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
 
         models = PROVIDER_MODELS.get(prov_name, [])
@@ -1509,7 +1530,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         section = parts[1]
         prov_name = parts[2]
         model_id = parts[3]
-        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        prov_url, prov_key, _ = PROVIDERS[prov_name]
         fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
 
         # Разрешаем индекс в model_id для всех провайдеров
@@ -1538,7 +1559,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         section = parts[1]
         prov_name = parts[2]
-        prov_url, prov_key, _, _ = PROVIDERS[prov_name]
+        prov_url, prov_key, _ = PROVIDERS[prov_name]
 
         await query.edit_message_text(
             f"✏️ `{prov_name.upper()}` — своя модель (фолбек)\n\n"
@@ -1575,18 +1596,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_model = getattr(providers, model_key, "")
             current_fb_url = getattr(providers, fb_url_key, "")
 
-            # Определяем имя провайдера
+            # Определяем имя провайдера по URL
             provider_name = "custom"
-            for pn, (pu, _, pm, __) in PROVIDERS.items():
-                if current_url == pu and current_model == pm:
+            for pn, (pu, _, _) in PROVIDERS.items():
+                if current_url == pu:
                     provider_name = pn
                     break
 
             fb_name = "выкл"
             if current_fb_url:
                 fb_name = "custom"
-                for pn, (pu, _, pm, __) in PROVIDERS.items():
-                    if current_fb_url == pu and getattr(providers, fb_model_key, "") == pm:
+                for pn, (pu, _, _) in PROVIDERS.items():
+                    if current_fb_url == pu:
                         fb_name = pn
                         break
 
@@ -1693,7 +1714,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Возвращаемся к списку провайдеров секции
         for section, (url_key, _, _) in SECTION_KEYS.items():
             url_val = getattr(providers, url_key, "")
-            for pn, (pu, _, _, _) in PROVIDERS.items():
+            for pn, (pu, _, _) in PROVIDERS.items():
                 if pn == prov_name and url_val == pu:
                     # Имитируем callback "prov:section:prov_name"
                     query._data = f"prov:{section}:{prov_name}"

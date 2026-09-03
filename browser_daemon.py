@@ -16,6 +16,7 @@ HTTP API на 127.0.0.1:18933, JSON POST: {"action": "...", ...args}.
 """
 
 import json
+import logging
 import os
 import queue
 import re
@@ -24,9 +25,16 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+logger = logging.getLogger("browser_daemon")
+
 WORKSPACE = Path("/root/tg_bot/workspace")
 STATE_DIR = WORKSPACE / "browser_state"
 SHOTS_DIR = WORKSPACE / "browser_shots"
+# Постоянные папки браузерных профилей (launch_persistent_context).
+# Куки + IndexedDB + localStorage + ServiceWorkers живут в этих папках и
+# переживают перезапуск демона (в отличие от storage_state, который переносит
+# только cookies+localStorage и теряет остальное состояние браузера).
+PROFILE_DIR = STATE_DIR / "profiles"
 HOST, PORT = "127.0.0.1", 18933
 
 NAV_TIMEOUT = int(os.environ.get("BROWSER_NAV_TIMEOUT_MS", "50000"))
@@ -38,7 +46,9 @@ REQUEST_TIMEOUT = int(os.environ.get("BROWSER_REQUEST_TIMEOUT", "65"))
 SELECTOR = (
     "button, a[href], input, select, textarea, "
     "[role='button'], [role='link'], [role='textbox'], [role='checkbox'], "
-    "[role='radio'], [role='combobox'], [role='option'], [role='tab']"
+    "[role='radio'], [role='combobox'], [role='option'], [role='tab'], "
+    "input[type='submit'], input[type='button'], "
+    "[class*='btn' i], [class*='button' i]"
 )
 
 # Внедряется в каждую страницу контекста: новое "окно" не создаётся,
@@ -114,6 +124,7 @@ class BrowserManager:
         self.page = None
         self.profile = None
         self.refs = {}          # ref -> Playwright locator
+        self.last_url = None    # последний посещённый URL (для open() без аргумента)
         self.last_used = 0.0
 
     # ---------- запуск / останов ----------
@@ -141,8 +152,10 @@ class BrowserManager:
 
         self._pw = sync_playwright().start()
         self.profile = profile
-        state_file = STATE_DIR / f"{profile}.json"
+        profile_path = PROFILE_DIR / profile
+        profile_path.mkdir(parents=True, exist_ok=True)
         kwargs = {
+            "user_data_dir": str(profile_path),
             "headless": True,
             "args": [
                 "--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu",
@@ -152,22 +165,92 @@ class BrowserManager:
         proxy = self._proxy_from_env()
         if proxy:
             kwargs["proxy"] = proxy
-        self.browser = self._pw.chromium.launch(**kwargs)
-        if state_file.exists():
-            self.context = self.browser.new_context(storage_state=str(state_file))
-        else:
-            self.context = self.browser.new_context()
+        # persistent-context: возвращает BrowserContext, вся папка профиля
+        # (куки+IndexedDB+localStorage+ServiceWorkers) постоянна между запусками.
+        self.context = self._pw.chromium.launch_persistent_context(**kwargs)
+        self.browser = self.context
+        self._migrate_legacy_cookies(profile, profile_path)
         self.context.add_init_script(INIT_SCRIPT)
         self.context.on("page", self._on_new_page)
-        self.page = self.context.new_page()
+        # У persistent-context уже есть стартовая страница about:blank
+        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.set_default_timeout(ACTION_TIMEOUT)
         self.refs = {}
         self.last_used = time.time()
+        self._load_last_url(profile)
+
+    def _url_file(self, profile):
+        return PROFILE_DIR / f"{profile}.url"
+
+    def _load_last_url(self, profile):
+        """Прочитать последний посещённый URL профиля (из файла при старте демона)."""
+        uf = self._url_file(profile)
+        try:
+            u = uf.read_text(encoding="utf-8").strip()
+            if u.startswith(("http://", "https://")):
+                self.last_url = u
+        except Exception:
+            self.last_url = None
+
+    def _save_last_url(self):
+        u = self.last_url
+        if not u or self.profile is None:
+            return
+        try:
+            self._url_file(self.profile).write_text(u, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _migrate_legacy_cookies(self, profile, profile_path):
+        """Одноразовый перенос кук из старого storage_state (*.json) в новый
+        постоянный профиль. Нужен только при первом запуске после перехода на
+        persistent-context (папка профиля пуста). Дальше куки хранятся сами."""
+        try:
+            is_new = not any(profile_path.iterdir())
+        except Exception:
+            is_new = False
+        if not is_new:
+            return
+        state_file = STATE_DIR / f"{profile}.json"
+        if not state_file.exists():
+            return
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        cookies = data.get("cookies", []) if isinstance(data, dict) else []
+        if not cookies:
+            return
+        import urllib.parse
+        valid = []
+        for c in cookies:
+            try:
+                if not c.get("name") or not c.get("value"):
+                    continue
+                if c.get("expires", -1) != -1 and c.get("expires", 0) < time.time():
+                    continue
+                valid.append({
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", "/"),
+                    "expires": c.get("expires", -1),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                    "secure": bool(c.get("secure", False)),
+                    "sameSite": c.get("sameSite", "Lax"),
+                })
+            except Exception:
+                continue
+        if valid:
+            self.context.add_cookies(valid)
+            logger.info(f"🍪 [BROWSER] Миграция: перенесено {len(valid)} кук из {state_file.name} в постоянный профиль")
+        # Пометить, что миграция проведена (запись в неиспользуемый json — чтобы
+        # на последующих запусках не перебирать снова; профиль уже непустой).
 
     def _close_nolock(self):
         try:
-            if self.browser:
-                self.browser.close()
+            if self.context:
+                self.context.close()
         except Exception:
             pass
         self.browser = None
@@ -186,16 +269,22 @@ class BrowserManager:
         return {"closed": True}
 
     def maybe_idle_close(self):
-        if self.browser and (time.time() - self.last_used) > IDLE_CLOSE_SECONDS:
+        if self.context and (time.time() - self.last_used) > IDLE_CLOSE_SECONDS:
+            # Запомнить текущую вкладку, чтобы после idle-закрытия её можно было
+            # восстановить (reload/open без url откроют последний посещённый URL).
+            try:
+                u = self.page.url if self.page else ""
+                if u and u.startswith(("http://", "https://")) and u != "about:blank":
+                    self.last_url = u
+                    self._save_last_url()
+            except Exception:
+                pass
             self._close_nolock()
 
     def save_state(self):
-        try:
-            f = STATE_DIR / f"{self.profile or 'main'}.json"
-            f.parent.mkdir(parents=True, exist_ok=True)
-            self.context.storage_state(path=str(f))
-        except Exception:
-            pass
+        # Постоянный профиль сам сохраняет всё состояние в свою папку.
+        # Ничего писать не нужно.
+        pass
 
     def _touch(self):
         self.last_used = time.time()
@@ -244,6 +333,24 @@ class BrowserManager:
                         name = re.sub(r"\s+", " ", (v or "")).strip()
                         break
                 if not name:
+                    # Поле без placeholder/aria-label: ищем подпись через <label for>
+                    # или вложенный <label>/родитель с классом label. Также сам <label>.
+                    try:
+                        lbl = loc.evaluate("""el => {
+                            if (el.id) {
+                                const l = document.querySelector("label[for='" + CSS.escape(el.id) + "']");
+                                if (l && l.textContent) return l.textContent.trim();
+                            }
+                            const lb = el.closest("label");
+                            if (lb && lb.textContent && lb !== el) return lb.textContent.trim();
+                            const inner = el.querySelector("label");
+                            if (inner && inner.textContent) return inner.textContent.trim();
+                            return "";
+                        }""") or ""
+                    except Exception:
+                        lbl = ""
+                    name = re.sub(r"\s+", " ", lbl).strip()
+                if not name:
                     try:
                         txt = loc.inner_text(timeout=2000) or ""
                     except Exception:
@@ -254,17 +361,21 @@ class BrowserManager:
                     href = (loc.get_attribute("href") or "").strip()
                 # Мусор-фильтры: безликие ссылки-скрипты, новостные атрибуции,
                 # HTML-обрывки в тексте, дубли заголовков (новостные карточки)
-                if not name and (href.startswith("javascript:") or not href):
-                    continue
+                if not name and tag not in ("input", "textarea", "select", "label"):
+                    if href.startswith("javascript:") or not href:
+                        continue
                 if name.startswith("©") or name.startswith("<") and name.endswith(">"):
                     continue
-                if name in skip_names:
+                if name in skip_names and tag not in ("input", "textarea", "select"):
                     continue
                 name = name[:80]
                 extra = ""
                 if tag == "a" and href.startswith(("http:", "https:", "/")):
                     path = href.split("?", 1)[0][:60]
                     extra = f" → {path}"
+                if tag in ("input", "textarea", "select") and not name:
+                    t = (loc.get_attribute("type") or tag)
+                    name = f"{t}-поле"
                 desc = f'{tag} "{name}"{extra}'.replace('""', "").strip()
                 seen[desc] = seen.get(desc, 0) + 1
                 if seen[desc] > max_dups:
@@ -325,9 +436,14 @@ class BrowserManager:
 
     # ---------- операции ----------
 
-    def open(self, url, profile="main"):
-        if not url.startswith(("http://", "https://")):
-            raise ValueError(f"URL должен быть http(s), получил: {url[:60]!r}")
+    def open(self, url="", profile="main"):
+        if not url or not url.strip():
+            url = self.last_url
+        if not url or not url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"URL должен быть http(s), получил: {str(url)[:60]!r}. "
+                "Передай url или открой предыдущую страницу, если она была."
+            )
         if profile != (self.profile or "main"):
             self._close_nolock()
         self.ensure_started(profile)
@@ -337,6 +453,8 @@ class BrowserManager:
             self.page.wait_for_timeout(1500)
         except Exception:
             pass
+        self.last_url = url
+        self._save_last_url()
         self.save_state()
         self._touch()
         return self.snapshot(include_text=False)
@@ -403,11 +521,25 @@ class BrowserManager:
     def reload(self):
         self.ensure_started()
         self._prune_extra_pages()
-        self.page.reload(timeout=NAV_TIMEOUT)
+        try:
+            cur = self.page.url
+        except Exception:
+            cur = ""
+        # Если вкладки нет (браузер был убит по idle-таймауту, страница пуста) —
+        # восстановить последний посещённый URL, а не крутить пустую about:blank.
+        if not cur or cur in ("", "about:blank") or not cur.startswith(("http://", "https://")):
+            if self.last_url:
+                self.page.goto(self.last_url, wait_until="load", timeout=NAV_TIMEOUT)
+            else:
+                raise ValueError("Нет текущей страницы и нет сохранённого последнего URL — открой что-то через open(url).")
+        else:
+            self.page.reload(timeout=NAV_TIMEOUT)
         try:
             self.page.wait_for_timeout(1500)
         except Exception:
             pass
+        self.last_url = cur if (cur and cur not in ("", "about:blank") and cur.startswith(("http://", "https://"))) else self.last_url
+        self._save_last_url()
         self.save_state()
         self._touch()
         return self.snapshot(include_text=False)
@@ -450,9 +582,17 @@ class BrowserManager:
     def reset_state(self, profile="main"):
         if profile == (self.profile or "main"):
             self._close_nolock()
-        f = STATE_DIR / f"{profile}.json"
+            self.last_url = None
+        f = PROFILE_DIR / profile
         if f.exists():
-            f.unlink()
+            import shutil
+            shutil.rmtree(f, ignore_errors=True)
+        uf = self._url_file(profile)
+        if uf.exists():
+            try:
+                uf.unlink()
+            except Exception:
+                pass
         return {"reset": profile}
 
 
@@ -510,7 +650,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    for d in (STATE_DIR, SHOTS_DIR):
+    for d in (STATE_DIR, SHOTS_DIR, PROFILE_DIR):
         d.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_worker_main, daemon=True).start()
     threading.Thread(target=_idle_loop, daemon=True).start()

@@ -207,14 +207,16 @@ PROXY_ENV_KEYS = {
     "gpt": "PROXY_GPT",
 }
 
-# Готовые провайдеры: имя -> (url, key, model, proxy)
+# Готовые провайдеры: имя -> (url, key, proxy).
+# Модель провайдера НЕ храним тут — модели живут в PROVIDER_MODELS (список)
+# и выбираются по секциям (SECTION_KEYS / *_MODEL). Поле провайдера не использовалось.
 PROVIDERS = {
-    "alice": ("http://127.0.0.1:8000/v1", ALICE_KEY, "yandex-alice", PROXY_ALICE),
-    "gpt": ("http://127.0.0.1:5040/v1", GPT_KEY, "chatgpt", PROXY_GPT),
-    "deepseek": ("http://127.0.0.1:9655/v1", DEEPSEEK_KEY, "deepseek-chat", PROXY_DEEPSEEK),
-    "gemini": ("http://127.0.0.1:4984/v1", GEMINI_KEY, "gemini-3.6-flash", PROXY_GEMINI),
-    "g4f": ("https://g4f.space/api/gemini", "", "models/gemini-3.5-flash", PROXY_G4F),
-    "openrouter": ("https://openrouter.ai/api/v1", OPENROUTER_KEY, "minimax/minimax-m3:free", PROXY_OPENROUTER),
+    "alice": ("http://127.0.0.1:8000/v1", ALICE_KEY, PROXY_ALICE),
+    "gpt": ("http://127.0.0.1:5040/v1", GPT_KEY, PROXY_GPT),
+    "deepseek": ("http://127.0.0.1:9655/v1", DEEPSEEK_KEY, PROXY_DEEPSEEK),
+    "gemini": ("http://127.0.0.1:4984/v1", GEMINI_KEY, PROXY_GEMINI),
+    "g4f": ("https://g4f.space/api/gemini", G4F_KEY, PROXY_G4F),
+    "openrouter": ("https://openrouter.ai/api/v1", OPENROUTER_KEY, PROXY_OPENROUTER),
 }
 
 # Модели по провайдерам
