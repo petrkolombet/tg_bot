@@ -8,6 +8,8 @@
 import json
 import urllib.request
 
+import providers
+
 DAEMON = "http://127.0.0.1:18933"
 
 TOOL = {
@@ -80,7 +82,7 @@ def _call(action, **kwargs):
     payload = json.dumps({"action": action, **kwargs}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(DAEMON, data=payload, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=70) as resp:
+        with providers.open_url(req, timeout=70) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise RuntimeError(f"демон браузера недоступен ({e}). Попроси владельца запустить tg-browser.service") from e

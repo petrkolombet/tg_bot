@@ -11,7 +11,8 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 import config
-from rag import insert_to_rag, query_rag
+import providers
+from rag import remember_window, query_rag, format_memory_answer
 import tools_registry
 
 logger = logging.getLogger(__name__)
@@ -74,52 +75,25 @@ def render_role(role):
     return "user" if role == "user" else "assistant"
 
 def _g4f_urlopen(req, timeout=180, proxy=None):
-    """Открывает URL через прокси. Если proxy не указан — использует PROXY_G4F.
-    Локальные адреса (localhost/127.0.0.1) всегда идут напрямую, БЕЗ прокси:
-    локальные сервисы сами ходят в интернет через свой прокси."""
-    use_proxy = proxy or config.PROXY_G4F
-    try:
-        host = urllib.parse.urlparse(req.full_url).hostname or ""
-    except Exception:
-        host = ""
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-        return urllib.request.urlopen(req, timeout=timeout)
-    if use_proxy:
-        proxy_handler = urllib.request.ProxyHandler({
-            "http": use_proxy,
-            "https": use_proxy,
-        })
-        opener = urllib.request.build_opener(proxy_handler)
-        return opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+    """Открывает URL. Тонкий враппер вокруг providers.open_url:
+    локальные адреса идут напрямую, внешние — через прокси провайдера."""
+    return providers.open_url(req, timeout=timeout, proxy=proxy)
 
 
 def _proxy_for_url(base_url):
-    """Возвращает распарсенный прокси для провайдера по его URL (PROXY_ENV_KEYS),
-    или None если прокси не настроен / URL локальный."""
-    if not base_url:
-        return None
-    try:
-        host = urllib.parse.urlparse(base_url).hostname or ""
-    except Exception:
-        host = ""
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-        return None
-    name = config.get_provider_name(base_url)
-    proxy_key = config.PROXY_ENV_KEYS.get(name.lower(), "")
-    raw = getattr(config, proxy_key, "") if proxy_key else ""
-    return config.parse_proxy(raw) if raw else None
+    """Прокси провайдера по URL (или None для локальных адресов). Деллегирует в providers."""
+    return providers.proxy_for_url(base_url)
 
 
 async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
     """Генерация через основной провайдер ( OpenRouter / g4f.space ). Ретраи при 429/сбоях."""
     if is_stopped():
         return None
-    provider = config.get_provider_name(config.G4F_URL)
+    provider = providers.get_provider_name(providers.G4F_URL)
     # Определяем прокси по провайдеру
-    proxy_key = config.PROXY_ENV_KEYS.get(provider.lower(), "")
-    proxy_str = getattr(config, proxy_key, "") if proxy_key else ""
-    proxy = config.parse_proxy(proxy_str) if proxy_str else None
+    proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
+    proxy_str = getattr(providers, proxy_key, "") if proxy_key else ""
+    proxy = providers.parse_proxy(proxy_str) if proxy_str else None
     content = prompt
     if image_path:
         data, mime = _read_image_b64(image_path)
@@ -131,18 +105,18 @@ async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
             ]
             logger.info(f"🖼️ [{provider}] Картинка прикреплена: {image_path} ({len(data)} байт)")
     payload = json.dumps({
-        "model": config.G4F_MODEL,
+        "model": providers.G4F_MODEL,
         "messages": [{"role": "user", "content": content}],
         "temperature": temperature
     }).encode('utf-8')
-    url = f"{config.G4F_URL}/chat/completions"
+    url = f"{providers.G4F_URL}/chat/completions"
 
     headers = {"Content-Type": "application/json"}
     # Ключ берём из конфига провайдера
-    if config.G4F_KEY:
-        headers["Authorization"] = f"Bearer {config.G4F_KEY}"
-    elif config.OPENROUTER_KEY:
-        headers["Authorization"] = f"Bearer {config.OPENROUTER_KEY}"
+    if providers.G4F_KEY:
+        headers["Authorization"] = f"Bearer {providers.G4F_KEY}"
+    elif providers.OPENROUTER_KEY:
+        headers["Authorization"] = f"Bearer {providers.OPENROUTER_KEY}"
 
     # Признаки ошибки модели (возвращаются как текст, а не HTTP)
     G4F_ERROR_TEXTS = {
@@ -171,7 +145,7 @@ async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
                 with open("/root/tg_bot/last_raw_response.txt", "w") as f:
                     f.write(f"=== [{provider}] Попытка {attempt+1} ===\n")
                     f.write(f"URL: {url}\n")
-                    f.write(f"Модель: {config.G4F_MODEL}\n")
+                    f.write(f"Модель: {providers.G4F_MODEL}\n")
                     f.write(f"Ответ ({len(text)} симв):\n{text}\n")
                     f.write(f"--- RAW ({len(raw)} симв) ---\n{raw[:2000]}\n")
             except Exception:
@@ -251,7 +225,7 @@ async def _try_generate(url, key, model, prompt, temperature, image_path, provid
         headers["Authorization"] = f"Bearer {key}"
 
     # Определяем прокси для запроса
-    parsed_proxy = config.parse_proxy(proxy) if proxy else None
+    parsed_proxy = providers.parse_proxy(proxy) if proxy else None
 
     for attempt in range(attempt_limit):
         if is_stopped():
@@ -279,25 +253,25 @@ async def safe_generate_content(prompt, temperature=0.85, image_path=None):
     """Генерация с фолбеком: основной провайдер → MAIN_FALLBACK."""
     if is_stopped():
         return None
-    provider = config.get_provider_name(config.G4F_URL)
+    provider = providers.get_provider_name(providers.G4F_URL)
     # Определяем прокси по URL провайдера
-    proxy_key = config.PROXY_ENV_KEYS.get(provider.lower(), "")
-    proxy = getattr(config, proxy_key, "") if proxy_key else ""
+    proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
+    proxy = getattr(providers, proxy_key, "") if proxy_key else ""
     result = await _try_generate(
-        config.G4F_URL, config.G4F_KEY, config.G4F_MODEL,
+        providers.G4F_URL, providers.G4F_KEY, providers.G4F_MODEL,
         prompt, temperature, image_path, provider, attempt_limit=4, proxy=proxy
     )
     if result:
         return result
 
     # Фолбек
-    if config.MAIN_FALLBACK_URL:
-        fb = config.get_provider_name(config.MAIN_FALLBACK_URL)
-        fb_proxy_key = config.PROXY_ENV_KEYS.get(fb.lower(), "")
-        fb_proxy = getattr(config, fb_proxy_key, "") if fb_proxy_key else ""
+    if providers.MAIN_FALLBACK_URL:
+        fb = providers.get_provider_name(providers.MAIN_FALLBACK_URL)
+        fb_proxy_key = providers.PROXY_ENV_KEYS.get(fb.lower(), "")
+        fb_proxy = getattr(providers, fb_proxy_key, "") if fb_proxy_key else ""
         logger.info(f"🔄 [{provider}] Фолбек → {fb}")
         result = await _try_generate(
-            config.MAIN_FALLBACK_URL, config.MAIN_FALLBACK_KEY, config.MAIN_FALLBACK_MODEL,
+            providers.MAIN_FALLBACK_URL, providers.MAIN_FALLBACK_KEY, providers.MAIN_FALLBACK_MODEL,
             prompt, temperature, image_path, fb, attempt_limit=2, proxy=fb_proxy
         )
         if result:
@@ -308,9 +282,9 @@ async def safe_generate_content(prompt, temperature=0.85, image_path=None):
 
 async def _chat_completion(prompt, temperature=0.7, proxy_url=None, proxy_key=None, model=None, tag="tg_bot_chat", session_type=None):
     """Универсальный OpenAI-совместимый запрос (используется для рефлексии/выжимок)."""
-    model = model or config.SEARCH_MODEL
-    proxy_url = proxy_url or config.SEARCH_PROXY_URL
-    proxy_key = proxy_key or config.SEARCH_PROXY_KEY
+    model = model or providers.SEARCH_MODEL
+    proxy_url = proxy_url or providers.SEARCH_PROXY_URL
+    proxy_key = proxy_key or providers.SEARCH_PROXY_KEY
     logger.info(f"📤 [{tag}:{model}] Отправка промпта длиной: {len(prompt)} символов")
     payload_dict = {
         "model": model,
@@ -322,7 +296,7 @@ async def _chat_completion(prompt, temperature=0.7, proxy_url=None, proxy_key=No
     payload = json.dumps(payload_dict).encode('utf-8')
 
     req = urllib.request.Request(
-        config.chat_completions_url(proxy_url),
+        providers.chat_completions_url(proxy_url),
         data=payload,
         headers={
             "Content-Type": "application/json",
@@ -348,19 +322,19 @@ async def _chat_completion(prompt, temperature=0.7, proxy_url=None, proxy_key=No
 async def _summary_fallback(payload_dict, tag="SUMMARY"):
     """Фолбек: сначала SUMMARY_FALLBACK_URL (если настроен), потом CHATGPT_FALLBACK."""
     # Приоритет: настроенный через /models → старый ChatGPT-фолбек
-    fallback_url = config.SUMMARY_FALLBACK_URL or config.CHATGPT_FALLBACK_URL
-    fallback_key = config.SUMMARY_FALLBACK_KEY or config.CHATGPT_FALLBACK_KEY
-    fb_name = config.get_provider_name(fallback_url)
+    fallback_url = providers.SUMMARY_FALLBACK_URL or providers.CHATGPT_FALLBACK_URL
+    fallback_key = providers.SUMMARY_FALLBACK_KEY or providers.CHATGPT_FALLBACK_KEY
+    fb_name = providers.get_provider_name(fallback_url)
 
     # Определяем прокси для фолбека по провайдеру
     fb_lower = fb_name.lower()
-    proxy_for_fb_key = config.PROXY_ENV_KEYS.get(fb_lower, "")
-    proxy_for_fb = getattr(config, proxy_for_fb_key, "") if proxy_for_fb_key else ""
-    parsed_fb_proxy = config.parse_proxy(proxy_for_fb) if proxy_for_fb else None
+    proxy_for_fb_key = providers.PROXY_ENV_KEYS.get(fb_lower, "")
+    proxy_for_fb = getattr(providers, proxy_for_fb_key, "") if proxy_for_fb_key else ""
+    parsed_fb_proxy = providers.parse_proxy(proxy_for_fb) if proxy_for_fb else None
 
     try:
         req = urllib.request.Request(
-            config.chat_completions_url(fallback_url),
+            providers.chat_completions_url(fallback_url),
             data=json.dumps(payload_dict).encode('utf-8'),
             headers={
                 "Content-Type": "application/json",
@@ -405,7 +379,7 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
     )
 
     payload_dict = {
-        "model": config.SUMMARY_MODEL,
+        "model": providers.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -415,14 +389,14 @@ async def summarize_tool_output(cmd, purpose, output, state_manager):
     }
 
     req = urllib.request.Request(
-        config.chat_completions_url(config.SUMMARY_PROXY_URL),
+        providers.chat_completions_url(providers.SUMMARY_PROXY_URL),
         data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
+            "Authorization": f"Bearer {providers.SUMMARY_PROXY_KEY}"
         }
     )
-    _summary_proxy = _proxy_for_url(config.SUMMARY_PROXY_URL)
+    _summary_proxy = _proxy_for_url(providers.SUMMARY_PROXY_URL)
 
     for attempt in range(2):
         try:
@@ -469,7 +443,7 @@ async def summarize_search_result(search_query, output, state_manager):
     )
 
     payload_dict = {
-        "model": config.SUMMARY_MODEL,
+        "model": providers.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -479,14 +453,14 @@ async def summarize_search_result(search_query, output, state_manager):
     }
 
     req = urllib.request.Request(
-        config.chat_completions_url(config.SUMMARY_PROXY_URL),
+        providers.chat_completions_url(providers.SUMMARY_PROXY_URL),
         data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
+            "Authorization": f"Bearer {providers.SUMMARY_PROXY_KEY}"
         }
     )
-    _summary_proxy = _proxy_for_url(config.SUMMARY_PROXY_URL)
+    _summary_proxy = _proxy_for_url(providers.SUMMARY_PROXY_URL)
 
     for attempt in range(2):
         try:
@@ -508,13 +482,13 @@ async def summarize_search_result(search_query, output, state_manager):
     return output[:config.TOOL_RESULT_LIMIT] + f"\n... (всего {len(output)} симв.)"
 
 def perplexity_search(query):
-    if not config.PERPLEXITY_COOKIE or not config.PERPLEXITY_RW_TOKEN:
+    if not providers.PERPLEXITY_COOKIE or not providers.PERPLEXITY_RW_TOKEN:
         return None
     import uuid as _uuid
     params = {
         "last_backend_uuid": str(_uuid.uuid4()),
         "frontend_uuid": str(_uuid.uuid4()),
-        "read_write_token": config.PERPLEXITY_RW_TOKEN,
+        "read_write_token": providers.PERPLEXITY_RW_TOKEN,
         "query_source": "user",
         "source": "default",
         "mode": "copilot",
@@ -537,11 +511,11 @@ def perplexity_search(query):
             "Origin": "https://www.perplexity.ai",
             "Referer": "https://www.perplexity.ai/",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-            "Cookie": config.PERPLEXITY_COOKIE,
+            "Cookie": providers.PERPLEXITY_COOKIE,
         },
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=90)
+        resp = providers.open_url(req, timeout=90)
         chunk = resp.read().decode('utf-8', 'replace')
     except Exception as e:
         logger.error(f"❌ [PERPLEXITY] запрос упал: {e}")
@@ -618,7 +592,7 @@ async def search_web_g4f(query):
     url = "https://g4f.space/api/Gemini/chat/completions"
 
     # Прокси g4f
-    g4f_proxy = config.parse_proxy(config.PROXY_G4F) if config.PROXY_G4F else None
+    g4f_proxy = providers.parse_proxy(providers.PROXY_G4F) if providers.PROXY_G4F else None
 
     for attempt in range(2):
         try:
@@ -644,7 +618,7 @@ async def search_web_g4f(query):
 async def search_web(query):
     logger.info(f"🔍 [SEARCH] Поиск: {query}")
     payload = json.dumps({
-        "model": config.SEARCH_MODEL,
+        "model": providers.SEARCH_MODEL,
         "messages": [
             {"role": "user", "content": query}
         ],
@@ -654,15 +628,15 @@ async def search_web(query):
     }).encode('utf-8')
 
     req = urllib.request.Request(
-        config.chat_completions_url(config.SEARCH_PROXY_URL),
+        providers.chat_completions_url(providers.SEARCH_PROXY_URL),
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.SEARCH_PROXY_KEY}"
+            "Authorization": f"Bearer {providers.SEARCH_PROXY_KEY}"
         }
     )
 
-    _search_proxy = _proxy_for_url(config.SEARCH_PROXY_URL)
+    _search_proxy = _proxy_for_url(providers.SEARCH_PROXY_URL)
 
     for attempt in range(2):
         try:
@@ -680,28 +654,28 @@ async def search_web(query):
                 await asyncio.sleep(2)
 
     # Фолбек: настроенный через /models
-    if config.SEARCH_FALLBACK_URL:
-        fb_name = config.get_provider_name(config.SEARCH_FALLBACK_URL)
+    if providers.SEARCH_FALLBACK_URL:
+        fb_name = providers.get_provider_name(providers.SEARCH_FALLBACK_URL)
         logger.info(f"🔄 [SEARCH] Фолбек → {fb_name}")
         try:
             fb_payload = json.dumps({
-                "model": config.SEARCH_FALLBACK_MODEL,
+                "model": providers.SEARCH_FALLBACK_MODEL,
                 "messages": [{"role": "user", "content": query}],
                 "temperature": 0.3,
             }).encode('utf-8')
             fb_req = urllib.request.Request(
-                config.chat_completions_url(config.SEARCH_FALLBACK_URL),
+                providers.chat_completions_url(providers.SEARCH_FALLBACK_URL),
                 data=fb_payload,
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {config.SEARCH_FALLBACK_KEY}"
+                    "Authorization": f"Bearer {providers.SEARCH_FALLBACK_KEY}"
                 }
             )
             loop = asyncio.get_running_loop()
             # Прокси фолбека — по провайдеру фолбека (как у основного)
-            fb_proxy_key = config.PROXY_ENV_KEYS.get(fb_name.lower(), "")
-            fb_proxy_str = getattr(config, fb_proxy_key, "") if fb_proxy_key else ""
-            fb_proxy = config.parse_proxy(fb_proxy_str) if fb_proxy_str else None
+            fb_proxy_key = providers.PROXY_ENV_KEYS.get(fb_name.lower(), "")
+            fb_proxy_str = getattr(providers, fb_proxy_key, "") if fb_proxy_key else ""
+            fb_proxy = providers.parse_proxy(fb_proxy_str) if fb_proxy_str else None
             resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(fb_req, timeout=60, proxy=fb_proxy))
             data = json.loads(resp.read().decode('utf-8'))
             text = data["choices"][0]["message"]["content"]
@@ -778,7 +752,7 @@ async def try_parse_or_repair_json(raw_text):
     return None
 
 async def retrieve_memory(user_query, query_topic, state_manager):
-    logger.info(f"🧠 [MEMORY] Запущен процесс воспоминания по теме: '{query_topic}'")
+    logger.info(f"🧠 [MEMORY] ВСПОМИНАЮ: {query_topic}")
     
     r1 = r2 = ""
     if query_topic:
@@ -789,9 +763,11 @@ async def retrieve_memory(user_query, query_topic, state_manager):
         r1 = r1 or ""
         r2 = r2 or ""
     result = "\n---\n".join(x for x in (r1, r2) if x)
-    logger.info(f"🧠 [MEMORY] Поиск по '{query_topic}': r1={len(r1)} симв, r2={len(r2)} симв, всего={len(result)} симв")
     if result:
-        logger.info(f"🧠 [MEMORY] Первые 100 символов результата: {result[:100]!r}")
+        # LLM-шаг: формируем ответ для бота по сырым фрагментам
+        formatted = await format_memory_answer(user_query, result)
+        if formatted:
+            result = formatted
 
     if result:
         # Запись в историю: короткий результат — целиком, длинный — только факт "вспоминал"
@@ -801,7 +777,7 @@ async def retrieve_memory(user_query, query_topic, state_manager):
             rec = f'🧠 вспоминал: "{query_topic}" (результат большой, без текста)'
         await state_manager.add_tool_record(rec)
 
-        memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот контекст из памяти:\n---\n{result}\n---\nТвоя задача — изучить контекст и ответить на вопрос: '{user_query}'. Если ты уже знаешь ответ из контекста диалога — используй его. Следуй своему характеру. Если ответа нет, честно признайся."
+        memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот что нашла система памяти:\n---\n{result}\n---\nТвоя задача — ответить на вопрос: '{user_query}'. Используй найденные данные. Следуй своему характеру. Если ответа нет, честно признайся."
         if len(result) > config.TOOL_RESULT_LIMIT:
             memory_context += "\n\nПРИМЕЧАНИЕ: результат воспоминания оказался длинным — отвечай пользователю КОРОТКО, по существу."
     else:
@@ -812,17 +788,25 @@ async def retrieve_memory(user_query, query_topic, state_manager):
 async def update_longterm_summary(state_manager):
     """Обновляет долгосрочное саммари через настроенный провайдер (SUMMARY_*) каждые 50 сообщений."""
     logger.info(f"📌 [SUMMARY] Запуск обновления саммари (messages_since_summary={state_manager.state.get('messages_since_summary', 0)})")
-    summary_prov = config.get_provider_name(config.SUMMARY_PROXY_URL)
+    summary_prov = providers.get_provider_name(providers.SUMMARY_PROXY_URL)
 
     # Последние 50 сообщений диалога
-    recent = state_manager.state["chat_history"][-50:]
+    recent = state_manager.state["chat_history"][-config.CHAT_HISTORY_LIMIT:]
     if not recent:
         logger.warning("📌 [SUMMARY] Нет сообщений для саммари")
         return
 
     recent_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in recent])
-    prev_summary = state_manager.state.get("summary", "")
 
+    # Пакетное извлечение фактов из окна (вместе с триггером саммари)
+    window_messages = [
+        f"[{m.get('ts', '')}] {'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}"
+        for m in recent if m.get('content')
+    ]
+    if window_messages:
+        await remember_window(window_messages)
+
+    prev_summary = state_manager.state.get("summary", "")
     interests = state_manager.state.get("interests", [])
     interests_text = "\n".join([f"- {t['id']}: {t['text']}" for t in interests]) if interests else "(нет)"
 
@@ -855,7 +839,7 @@ async def update_longterm_summary(state_manager):
     )
 
     payload_dict = {
-        "model": config.SUMMARY_MODEL,
+        "model": providers.SUMMARY_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -866,7 +850,7 @@ async def update_longterm_summary(state_manager):
     }
 
 # --- ОСНОВНОЙ канал: провайдер саммари (SUMMARY_PROXY_URL) ---
-    _summary_proxy = _proxy_for_url(config.SUMMARY_PROXY_URL)
+    _summary_proxy = _proxy_for_url(providers.SUMMARY_PROXY_URL)
     # session_type не нужен всем провайдерам — убираем перед отправкой
     chatgpt_payload = dict(payload_dict)
     chatgpt_payload.pop("session_type", None)
@@ -874,11 +858,11 @@ async def update_longterm_summary(state_manager):
     # Сначала пробуем основной провайдер напрямую
     try:
         req = urllib.request.Request(
-            config.chat_completions_url(config.SUMMARY_PROXY_URL),
+            providers.chat_completions_url(providers.SUMMARY_PROXY_URL),
             data=json.dumps(chatgpt_payload).encode('utf-8'),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
+                "Authorization": f"Bearer {providers.SUMMARY_PROXY_KEY}"
             }
         )
         loop = asyncio.get_running_loop()
@@ -910,11 +894,11 @@ async def update_longterm_summary(state_manager):
 
     # --- Повтор через основной канал (с session_type, для совместимости с сессионными провайдерами) ---
     req = urllib.request.Request(
-        config.chat_completions_url(config.SUMMARY_PROXY_URL),
+        providers.chat_completions_url(providers.SUMMARY_PROXY_URL),
         data=json.dumps(payload_dict).encode('utf-8'),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.SUMMARY_PROXY_KEY}"
+            "Authorization": f"Bearer {providers.SUMMARY_PROXY_KEY}"
         }
     )
     for attempt in range(2):
@@ -953,39 +937,39 @@ async def update_longterm_summary(state_manager):
 async def _reflection_fallback(payload_dict):
     """Фолбек рефлексии: сначала основной провайдер, потом fallback."""
     # Основной провайдер
-    _refl_proxy = _proxy_for_url(config.REFLECTION_PROXY_URL)
+    _refl_proxy = _proxy_for_url(providers.REFLECTION_PROXY_URL)
     try:
         req = urllib.request.Request(
-            config.chat_completions_url(config.REFLECTION_PROXY_URL),
+            providers.chat_completions_url(providers.REFLECTION_PROXY_URL),
             data=json.dumps(payload_dict).encode('utf-8'),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {config.REFLECTION_PROXY_KEY}"
+                "Authorization": f"Bearer {providers.REFLECTION_PROXY_KEY}"
             }
         )
         loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(req, timeout=120, proxy=_refl_proxy))
         data = json.loads(resp.read().decode('utf-8'))
         text = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"🆘 [REFLECTION:{config.REFLECTION_MODEL}] Основной сработал: {len(text)} символов")
+        logger.info(f"🆘 [REFLECTION:{providers.REFLECTION_MODEL}] Основной сработал: {len(text)} символов")
         return text
     except Exception as e:
-        logger.error(f"❌ [REFLECTION:{config.REFLECTION_MODEL}] Основной не сработал: {e}")
+        logger.error(f"❌ [REFLECTION:{providers.REFLECTION_MODEL}] Основной не сработал: {e}")
 
     # Фолбек
-    fallback_url = config.REFLECTION_FALLBACK_URL or config.SUMMARY_FALLBACK_URL or config.CHATGPT_FALLBACK_URL
-    fallback_key = config.REFLECTION_FALLBACK_KEY or config.SUMMARY_FALLBACK_KEY or config.CHATGPT_FALLBACK_KEY
-    fb_name = config.get_provider_name(fallback_url)
+    fallback_url = providers.REFLECTION_FALLBACK_URL or providers.SUMMARY_FALLBACK_URL or providers.CHATGPT_FALLBACK_URL
+    fallback_key = providers.REFLECTION_FALLBACK_KEY or providers.SUMMARY_FALLBACK_KEY or providers.CHATGPT_FALLBACK_KEY
+    fb_name = providers.get_provider_name(fallback_url)
 
     # Прокси для фолбека по провайдеру
     fb_lower2 = fb_name.lower()
-    fb_proxy_key2 = config.PROXY_ENV_KEYS.get(fb_lower2, "")
-    fb_proxy_str2 = getattr(config, fb_proxy_key2, "") if fb_proxy_key2 else ""
-    parsed_fb_proxy2 = config.parse_proxy(fb_proxy_str2) if fb_proxy_str2 else None
+    fb_proxy_key2 = providers.PROXY_ENV_KEYS.get(fb_lower2, "")
+    fb_proxy_str2 = getattr(providers, fb_proxy_key2, "") if fb_proxy_key2 else ""
+    parsed_fb_proxy2 = providers.parse_proxy(fb_proxy_str2) if fb_proxy_str2 else None
 
     try:
         req = urllib.request.Request(
-            config.chat_completions_url(fallback_url),
+            providers.chat_completions_url(fallback_url),
             data=json.dumps(payload_dict).encode('utf-8'),
             headers={
                 "Content-Type": "application/json",
@@ -1024,20 +1008,20 @@ async def generate_reflection(state_manager):
     
     # --- ОСНОВНОЙ канал: рефлексия через свой фолбек ---
     fb_dict = {
-        "model": config.REFLECTION_MODEL,
+        "model": providers.REFLECTION_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": config.REFLECTION_TEMPERATURE,
     }
     raw_text = await _reflection_fallback(fb_dict)
     # --- Запасной канал: SUMMARYProxy ---
     if not raw_text:
-        raw_text = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
+        raw_text = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
     parsed = await try_parse_or_repair_json(raw_text)
     if parsed and parsed.get("thoughts"):
         return parsed["thoughts"]
     # Если вернул мусор — пробуем ещё раз через Alice напрямую
     if not (parsed and parsed.get("thoughts")):
-        alice_raw = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=config.SUMMARY_PROXY_URL, proxy_key=config.SUMMARY_PROXY_KEY, model=config.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
+        alice_raw = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
         parsed = await try_parse_or_repair_json(alice_raw) if alice_raw else None
         if parsed and parsed.get("thoughts"):
             return parsed["thoughts"]
@@ -1067,8 +1051,13 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
         logger.info(f"⚙️ [AI] Режим выполнения задачи: {clean_task_text}")
     else:
         # Обычная обработка сообщений пользователя
-        if memory_context:
-            memory_context_block = f"<MEMORY_CONTEXT>\n{memory_context}\n</MEMORY_CONTEXT>"
+        if memory_context or state_manager.state.get("active_memory"):
+            parts = []
+            if memory_context:
+                parts.append(memory_context)
+            if state_manager.state.get("active_memory"):
+                parts.append(state_manager.state["active_memory"])
+            memory_context_block = "<MEMORY_CONTEXT>\n" + "\n\n".join(parts) + "\n</MEMORY_CONTEXT>"
         
     mood_instr = state_manager.get_mood_instruction()
     history = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in state_manager.state["chat_history"]])
@@ -1138,6 +1127,6 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     parsed_json = await try_parse_or_repair_json(raw_text)
     
     if parsed_json:
-        provider = config.get_provider_name(config.G4F_URL)
+        provider = providers.get_provider_name(providers.G4F_URL)
         logger.info(f"📥 [{provider}] {len(prompt)} → {len(raw_text or '')} симв {parsed_json}")
     return parsed_json

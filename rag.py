@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 import uuid
 import urllib.parse
 
@@ -9,19 +10,246 @@ os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 
 from memorylite import MemoryAgent, MemoryAgentConfig
 from memorylite.llm import OpenAICompatibleJSONClient
-from memorylite.schema import ChatMessage, RecallDecision, RecallItem, RecallResult, now_ts
+from memorylite.schema import ChatMessage, ExtractionResult, RecallDecision, RecallItem, RecallResult, now_ts
 from memorylite.compiler import ContextCompiler
 
 logger = logging.getLogger(__name__)
 
-import config
+# ── Monkeypatch: кириллица в memorylite._search_terms ──────────────────────
+# memorylite извлекает только латиницу и CJK → русские запросы дают пустой
+# FTS-запрос,levance = 0, fallback не находит совпадений.
+# Патчим store._search_terms (FTS-кандидаты) и agent._search_terms (relevance).
+import re as _re
+
+def _patched_search_terms(self, text: str) -> list[str]:
+    """Извлекает ключевые слова: кириллица (≥3), CJK (≥2), латиница (≥3)."""
+    lower = text.lower()
+    cyrillic = _re.findall(r"[а-яё][а-яё0-9_-]{2,19}", lower)
+    cjk = _re.findall(r"[\u4e00-\u9fff]{2,8}", text)
+    latin = _re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,20}", lower)
+    return list(dict.fromkeys(cyrillic[:12] + cjk[:12] + latin[:12]))
+
+from memorylite.store import SQLiteStore
+SQLiteStore._search_terms = _patched_search_terms
+MemoryAgent._search_terms = _patched_search_terms
+
+# ── Monkeypatch: нормализация фактов (нейтральные «замки» для вопросов-«ключей») ──
+# Штатный промпт memorylite велит «preserve the user's original statement literally»,
+# из-за чего в память попадают дословные реплики («Бот: тебя зовут Петя»), а не чистые
+# факты («Пользователя зовут Петя»). Это ломает ответ на вопрос бота «как меня зовут».
+# Переопределяем ModelMemoryController.extract_memories, чтобы факты записывались
+# нейтрально и однозначно: определяется субъект (бот/пользователь) и нормализованная формулировка.
+from memorylite.llm.model_controller import ModelMemoryController
+
+_WINDOW_EXTRACTION_PROMPT = """Ты — аккуратный агент записи долговременной памяти.
+
+Тебе дают окно последних сообщений диалога между пользователем и ассистентом-ботом,
+каждое с префиксом роли («Пользователь: …» или «Бот: …») и времени («[ЧЧ:ММ]» — время МСК).
+
+Сообщения даны в ХРОНОЛОГИЧЕСКОМ порядке: первая строка в окне — самое раннее по времени сообщение, последняя строка — самое позднее по времени (по возрастанию времени `[ЧЧ:ММ]` сверху вниз).
+Чем позже сообщение по времени — тем более АКТУАЛЬНОЕ состояние оно отражает.
+Если в окне сначала говорится одно, а позже — противоположное или уточняющее, то приоритет у ПОСЛЕДНЕГО (самого позднего по времени) сообщения: оно показывает итог.
+Фиксируй факты/статус по последнему сообщению, а не по раннему.
+
+Извлеки из этого окна ТОЛЬКО самые важные долговечные факты — те, которые стоит помнить долго:
+- реальные факты о пользователе (его предпочтения, вкусы, профессия, значимые события жизни, черты характера, ПРЯМО сказанные пользователем);
+- реальные факты о боте (его возможности/предпочтения, если они ПРЯМО зафиксированы в диалоге);
+- принятые решения и договорённости (только те, что реально были решены в окне);
+- длительные планы/задачи в процессе (только если это явно подтверждено в окне).
+
+ЖЁСТКИЕ ЗАПРЕТЫ (НЕ сохраняй это никогда):
+- ИМЕНА И ПОСТОЯННЫЕ ФАКТЫ, которые уже известны: как зовут пользователя (Петя) и бота (Левий) — это уже зафиксировано, НЕ записывай повторно.
+- МЕТА-РЕФЛЕКСИЮ И ВНУТРЕННИЕ СОСТОЯНИЯ БОТА: «Бот признал сбой», «Бот осознал ошибку», «Бот испытал замешательство/самокритику», «Бот запутался», «у бота нет доступа/нет воспоминаний». Это не долговременные факты, это мысли процесса — НЕ сохраняй.
+- ОТСУТСТВИЕ/ОТРИЦАНИЕ: «не помню», «нет воспоминаний», «не знает», «не имеет доступа» — отсутствие знания НЕ является фактом для памяти.
+- НЕ ДОДУМЫВАЙ И НЕ ЧИТАЙ ПОДТЕКСТ: не выводи психологию, намерения и чувства пользователя, если он не сказал их прямо. Запрещено: «пользователь предпочитает…», «пользователь планирует/хочет/намерен…», «пользователь отреагировал поддержкой…» — если пользователь не сказал это явно. Только буквально сказанное.
+  ИСКЛЮЧЕНИЕ (подтверждённое изменение состояния): если в окне сначала указано одно состояние («ещё не проверили», «не готово», «висит», «не работает»), а затем, ПОЗЖЕ по времени, оно явно подтверждено как сменившееся («Работает», «Готово», «Сделано», «Решено») — это фиксируемый факт итогового состояния, его сохраняй как kind=task_state или summary. Не выводи психологию и чувства, но подтверждённый итог — сохраняй.
+- ОДНОРАЗОВЫЕ ЭПИЗОДЫ И ДРАМЫ: разовое замешательство, путаница, извинения, «отпустило», «переклинило» — не сохранять.
+- РАЗГОВОР О САМОЙ СИСТЕМЕ ПАМЯТИ/ПРОЦЕССЕ ЕЁ СОЗДАНИЯ: «обсуждаем как улучшить память», «давай доделаем микро-сервис памяти» — это техпроцесс, НЕ факт для долгосрочной памяти. ИСКЛЮЧЕНИЕ: сам итог/статус (подтверждённое «работает», «не работает», «готово», «сделано») — это фиксируемый факт состояния, его сохраняй.
+- приветствия, «окей», «понял», «спасибо», короткие переспросы, «доброе утро», «как дела». ИСКЛЮЧЕНИЕ: короткая реплика, которая подтверждает смену состояния («Работает», «Готово», «Сделано», «Решено») после ранее сказанного иного — это итог по правилу выше, учитывай её, а не отбрасывай как пустое «окей».
+
+Сохраняй только то, что потом нужно будет вспомнить. Примеры: 
+
+ФАКТЫ:
+- «Пользователь живет в X»
+- «Пользователь занимается X»
+- «Бот решил вести дневних dairy.txt»
+- «Бот заинтересовался X»
+
+СОБЫТИЯ: 
+- «Пользователь написал стих Боту, чтобы он не грустил, Бот поблагодарил Пользователя»
+- «Бот и пользователь поссорились из-за X, затем Пользователь извинился»
+
+ПРЕДПОЧТЕНИЯ:
+- «Пользователь предпочитает/хочет X»
+- «Бот предпочитает/хочет X»
+
+СВОДКИ:
+- «Обсудили и решили перенести X на новый сервер»
+- «Пользователь рассказал о планах на отпуск в июле»
+
+ТЕКУЩИЕ ЗАДАЧИ:
+- «Ожидает: пользователь пообещал прислать список доменов»
+
+ИТОГ / СОСТОЯНИЕ, ИЗМЕНИВШЕЕСЯ СО ВРЕМЕНЕМ (применимо к любым сменам состояния, не только проверке):
+Это когда одна и та же вещь (задача, план, проект, проблема, ожидание, настройка) в окне сначала была в одном состоянии, а ПОЗЖЕ по времени — в другом, причём новое состояние подтверждено в диалоге. Признак: ранние реплики говорят одно («ещё не проверили», «надо сделать», «не работает»), а поздние — итог («работает», «готово», «сделано», «решено», «подтверждено»). В таком случае сохраняй именно ПОСЛЕДНЕЕ состояние как факт, а раннее — не сохраняй и не учитывай как актуальное.
+Примеры:
+- «Система памяти проверена и работает (подтверждено пользователем)» (в окне: сначала «ещё не проверили» → позже «Работает»)
+- «Ожидание/проблема/план решены → поставлено в статус „сделано/работает“» (в окне: сначала «висит/не сделано» → позже «готово/работает»)
+Если в окне сначала одно состояние, а позже — подтверждённое новое — сохраняй ПОСЛЕДНЕЕ, не раннее.
+
+Если во всём окне нет ни одного подтвержденного стойкого факта — верни memories: []. Лучше ничего, чем мусор.
+
+Верни строгий JSON с ключами:
+state_patch (object, можно пустой {}), memories (list[object]).
+
+Каждый объект memories обязан содержать: scope, scope_id_key, kind, content, summary, tags, importance, confidence.
+- scope_id_key — одно из значений ровно: session, user, project.
+- kind — одно из:
+  • fact — реальный стойкий факт о пользователе или боте (профессия, место жительства, черта характера, возможности).
+  • preference — предпочтение, вкус, привычка, что нравится/не нравится.
+  • event — конкретное событие или эпизод, который важно помнить.
+  • summary — итог/краткая сводка обсуждения, к чему пришли.
+  • task_state — текущая задача/план в процессе (в работе, ожидает, сделано).
+- importance — число от 0 до 1 (насколько это важно помнить долго; 0.9+ для очень важного).
+- confidence — число от 0 до 1.
+
+ПРИМЕР ПРАВИЛЬНОГО JSON-ВЫВОДА (заполни по аналогии, верни ровно такую структуру):
+{
+  "state_patch": {},
+  "memories": [
+    {
+      "scope": "user",
+      "scope_id_key": "user",
+      "kind": "preference",
+      "content": "Пользователь предпочитает краткие ответы",
+      "summary": "предпочитает краткие ответы",
+      "tags": ["предпочтения"],
+      "importance": 0.85,
+      "confidence": 0.8
+    }
+  ]
+}
+Если подходящих фактов нет — верни {"state_patch": {}, "memories": []}.
+
+ФОРМУЛИРОВКА — НЕЙТРАЛЬНАЯ, с явным указанием субъекта:
+  • о пользователе → «Пользователь предпочитает …», «У пользователя …», «Пользователь — …»;
+  • о боте → «Бот использует …», «Бот умеет …»;
+  • общее/о проекте → «Проект …», «Система …», «Сообщение …».
+НИКОГДА не копируй дословные реплики («Бот: …», «Пользователь: …») в content.
+Отвечай фактами, а не цитатами из диалога.
+"""
+
+_ORIG_EXTRACT = ModelMemoryController.extract_memories
+
+
+def _patched_extract_memories(self, session_id, user_message, assistant_message, recent_messages, existing_state, scope_ids):
+    try:
+        payload = self.client.complete_json(
+            system_prompt=_WINDOW_EXTRACTION_PROMPT,
+            user_prompt=(
+                f"user_message={user_message!r}\n"
+                f"assistant_message={assistant_message!r}\n"
+                f"recent_messages={[{'role': m.role, 'content': m.content[:120]} for m in recent_messages[-self.config.recent_prompt_window:]]!r}\n"
+                f"existing_state={existing_state!r}\n"
+                f"scope_ids={scope_ids!r}"
+            ),
+        )
+    except Exception:
+        return ExtractionResult()
+
+    raw_memories = payload.get("memories", [])
+    if not isinstance(raw_memories, list):
+        raw_memories = []
+
+    memories = []
+    seen = set()
+    for item in raw_memories:
+        memory = self._build_memory_record(
+            item=item,
+            raw_memory_count=len(raw_memories),
+            user_message=user_message,
+            assistant_message=assistant_message,
+            scope_ids=scope_ids,
+        )
+        if memory is None:
+            continue
+        key = (memory.scope, memory.scope_id, memory.kind, memory.content.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        memories.append(memory)
+
+    state_patch = payload.get("state_patch", {}) or {}
+    if not isinstance(state_patch, dict):
+        state_patch = {}
+    return ExtractionResult(memories=memories, state_patch=state_patch)
+
+
+ModelMemoryController.extract_memories = _patched_extract_memories
+# ───────────────────────────────────────────────────────────────────────────
+
+import providers
+
+# ── Новый слой: векторные эмбеддинги фактов (НЕ трогает recall / саммари) ──
+# Модель/URL/ключ берутся из провайдеров (providers.EMBED_*) — настраивается в /models → «Эмбеддинги».
+EMBED_MAX_BATCH = 16
+
+
+def _embed_model():
+    """Актуальная модель эмбеддингов из конфига провайдеров."""
+    try:
+        return providers.EMBED_MODEL or "liquid/lfm-2.5-embedding-350m:free"
+    except Exception:
+        return "liquid/lfm-2.5-embedding-350m:free"
+
+
+def _embed_batch(texts):
+    """Отправляет список строк в эмбеддер (провайдер из providers.EMBED_*), возвращает list[list[float]].
+    Длины совпадают с входом. При пустом входе — пустой список."""
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not texts:
+        return []
+    vecs = _embed_one(texts, providers.EMBED_URL, providers.EMBED_KEY, _embed_model())
+    if vecs:
+        return vecs
+    # Фолбек (если настроен в /models → «Эмбеддинги»)
+    if providers.EMBED_FALLBACK_URL:
+        logger.info("🆘 [EMBED] Основной эмбеддер не сработал, пробую фолбек")
+        vecs = _embed_one(texts, providers.EMBED_FALLBACK_URL, providers.EMBED_FALLBACK_KEY, providers.EMBED_FALLBACK_MODEL)
+        if vecs:
+            return vecs
+    return []
+
+
+def _embed_one(texts, url, key, model):
+    """Один вызов эмбеддера с ретраями. Возвращает list[list[float]] или None при отказе."""
+    for attempt in range(3):
+        try:
+            return providers.embed(url, key, model, texts, timeout=90)
+        except Exception as e:
+            logger.error(f"🧠 [EMBED] Ошибка (попытка {attempt + 1}): {e}")
+            if attempt < 2:
+                time.sleep(2)
+    return None
+
+
+def _cosine(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
 
 WORKING_DIR = "/root/tg_bot/rag_storage"
 DB_NAME = "memorylite.sqlite3"
 
-RAG_URL = config.RAG_URL
-RAG_KEY = config.RAG_KEY
-RAG_MODEL = config.RAG_MODEL
+RAG_URL = providers.RAG_URL
+RAG_KEY = providers.RAG_KEY
+RAG_MODEL = providers.RAG_MODEL
 
 _agent = None
 
@@ -55,7 +283,11 @@ class FreshSessionJSONClient(OpenAICompatibleJSONClient):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with providers.open_url(
+                request,
+                timeout=self.timeout_seconds,
+                proxy=providers.proxy_for_url(self.base_url),
+            ) as response:
                 result = json.loads(response.read().decode("utf-8"))
             content = result["choices"][0]["message"]["content"]
             parsed = self._parse_json_payload(content)
@@ -75,7 +307,7 @@ class FreshSessionJSONClient(OpenAICompatibleJSONClient):
                 url=f"{base}/session?agent={urllib.parse.quote(user_id)}",
                 method="DELETE",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with providers.open_url(req, timeout=10) as resp:
                 resp.read()
         except Exception as e:
             logger.warning(f"⚠️ Не удалил сессию LLM {user_id}: {e}")
@@ -107,23 +339,148 @@ def _get_agent():
     return _agent
 
 
-async def insert_to_rag(text, metadata=""):
+async def remember_window(messages, session_id="tg_bot_main"):
+    """Пакетно извлекает важные факты из окна диалога и записывает в память.
+    messages — список строк вида «Пользователь: …» / «Бот: …».
+    Запускается вместе с триггером саммари, а не на каждое сообщение."""
+    try:
+        text = "\n".join(messages) if messages else ""
+        if not text.strip():
+            return
+        loop = asyncio.get_running_loop()
+        agent = _get_agent()
+        scope_ids = {"session": session_id}
+
+        def _apply():
+            try:
+                result = agent.controller.extract_memories(
+                    session_id=session_id,
+                    user_message=text,
+                    assistant_message="",
+                    recent_messages=[],
+                    existing_state=agent.get_state("session", session_id),
+                    scope_ids=scope_ids,
+                )
+            except Exception as e:
+                logger.error(f"❌ remember_window extract_memories: {e}")
+                return
+            memories = [m for m in result.memories if (m.importance or 0) >= 0.55]
+            if not memories:
+                logger.info("🧠 [MEMORY] Окно: значимых фактов не найдено, память не пополнена")
+                return
+            embeddings = _embed_batch([m.content for m in memories])
+            agent.store.persist_extraction(
+                memories, [],
+                embeddings_model=_embed_model(),
+                memory_embeddings=embeddings or None,
+            )
+            for m in memories:
+                logger.info(f"🧠 [MEMORY] СОХРАНЕНО: {m.content}")
+
+        await loop.run_in_executor(None, _apply)
+    except Exception as e:
+        logger.error(f"❌ Ошибка remember_window: {e}")
+
+
+async def vector_search(query_text, top_k=5, threshold=0.30):
+    """Новый слой: векторный поиск по смыслу фактов в памяти.
+    Возвращает список content-ов фактов со сходством >= threshold, топ-k по убыванию.
+    При ошибке/пустых данных — пустой список. Не трогает recall/саммари."""
+    if not query_text or not query_text.strip():
+        return []
     try:
         loop = asyncio.get_running_loop()
         agent = _get_agent()
 
-        session_id = "tg_bot_main"
+        def _run():
+            try:
+                qvec = _embed_batch([query_text])
+            except Exception as e:
+                logger.error(f"🧠 [VECTOR] Ошибка эмбеддинга запроса: {e}")
+                return []
+            if not qvec or not qvec[0]:
+                return []
+            rows = agent.store.conn.execute(
+                "SELECT id, content FROM memories WHERE scope = ? AND scope_id = ?",
+                ("session", "tg_bot_main"),
+            ).fetchall()
+            if not rows:
+                return []
+            ids = [r["id"] for r in rows]
+            vecs = agent.store.load_memory_embeddings(ids, _embed_model())
+            scored = []
+            for r in rows:
+                v = vecs.get(r["id"])
+                if not v:
+                    continue
+                s = _cosine(qvec[0], v)
+                if s >= threshold:
+                    scored.append((s, r["content"]))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [content for _, content in scored[:top_k]]
 
-        def _remember():
-            agent.remember(
-                session_id=session_id,
-                user_message=text,
-                assistant_message="",
-            )
-
-        await loop.run_in_executor(None, _remember)
+        return await loop.run_in_executor(None, _run)
     except Exception as e:
-        logger.error(f"❌ Ошибка insert_to_rag: {e}")
+        logger.error(f"❌ Ошибка vector_search: {e}")
+        return []
+
+
+_ANSWER_FORMAT_PROMPT = """Ты — модуль памяти чат-бота. Тебе даны сырые факты из базы памяти и вопрос, который бот задаёт тебе (модулю памяти).
+
+ЗАДАЧА: по найденным фактам составь короткий ответ на вопрос бота.
+
+ПРАВИЛА:
+- Формулируй ответ ДЛЯ БОТА (не от его имени): «Тебя зовут …», «Ты говорил …», «Пользователь сказал …».
+- Если фактов достаточно — ответь конкретно, 1-2 предложения.
+- Если фактов мало или нет — честно скажи «В памяти ничего не нашлось».
+- Не придумывай то, чего нет в фактах.
+- Без воды и вводных слов."""
+
+
+async def format_memory_answer(query, raw_fragments):
+    """LLM-шаг: берёт сырые фрагменты из query_rag и формирует ответ для бота."""
+    if not raw_fragments:
+        return None
+    user_prompt = f"ФРАГМЕНТЫ ИЗ ПАМЯТИ:\n{raw_fragments}\n\nВОПРОС БОТА: {query}"
+
+    async def _one(url, key, model, tag):
+        try:
+            import json as _json
+            import urllib.request as _req
+            payload = _json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _ANSWER_FORMAT_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0,
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            full_url = providers.chat_completions_url(url)
+            req = _req.Request(url=full_url, data=payload, headers=headers, method="POST")
+            loop = asyncio.get_running_loop()
+            with providers.open_url(req, timeout=30, proxy=providers.proxy_for_url(full_url)) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            text = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"🧠 [MEMORY:{tag}] НАШЁЛ: {text}")
+            return text
+        except Exception as e:
+            logger.error(f"❌ [MEMORY:{tag}] Ошибка: {e}")
+            return None
+
+    text = await _one(RAG_URL, RAG_KEY, RAG_MODEL, providers.get_provider_name(RAG_URL))
+    if text:
+        return text
+
+    if providers.RAG_FALLBACK_URL:
+        fb = await _one(providers.RAG_FALLBACK_URL, providers.RAG_FALLBACK_KEY,
+                        providers.RAG_FALLBACK_MODEL, providers.get_provider_name(providers.RAG_FALLBACK_URL))
+        if fb:
+            return fb
+
+    return raw_fragments
 
 
 async def query_rag(query, top_k=5):

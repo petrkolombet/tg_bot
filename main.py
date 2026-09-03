@@ -43,7 +43,7 @@ def main():
     # Инициализация состояния
     state_manager = StateManager(config.STATE_FILE)
     
-    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).concurrent_updates(True).build()
     
     # Dependency Injection: Передаем зависимости в bot_data
     # Это разрывает круг импортов: handlers не нужно импортировать bot_ai напрямую

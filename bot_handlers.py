@@ -13,10 +13,11 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 import config
-from rag import insert_to_rag
+import providers
 import server_access
 import tools_registry
 from bot_ai import summarize_tool_output
+from rag import vector_search
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,6 @@ async def _send_acks(update, context, state_manager, ack_replies, reply_to_messa
         if not sent:
             continue
         await state_manager.add_history("model", ack_text)
-        asyncio.create_task(insert_to_rag(f"Бот: {ack_text}", metadata=f"bot_{chat_id}"))
         sent_n += 1
         if i < len(flat) - 1:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -529,7 +529,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     editing_proxy = context.user_data.get("editing_proxy")
     if editing_proxy:
         context.user_data.pop("editing_proxy", None)
-        proxy_env_key = config.PROXY_ENV_KEYS.get(editing_proxy, "")
+        proxy_env_key = PROXY_ENV_KEYS.get(editing_proxy, "")
         if not proxy_env_key:
             await update.message.reply_text("❌ неизвестный провайдер")
             return
@@ -583,13 +583,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(_typing_loop(context.bot, user_id, stop_typing))
-    
+
+    epoch = context.bot_data.get("gen_epoch", 0) + 1
+    context.bot_data["gen_epoch"] = epoch
+    context.bot_data["gen_task"] = asyncio.current_task()
+
     try:
         await state_manager.check_and_apply_peak_decay()
         await state_manager.add_history("user", user_text)
-        asyncio.create_task(insert_to_rag(f"Пользователь: {user_text}", metadata=f"user_{user_id}"))
         await state_manager.update_interaction()
-        
+
+        # Новый слой: векторная память по смыслу сообщения (подмешиваем, если есть совпадения)
+        hits = await vector_search(user_text)
+        if hits:
+            block = "\n".join(f"- {h}" for h in hits)
+            state_manager.state["active_memory"] = f"Вот факты из памяти, которые относятся к разговору. Используй их, только если они нужны прямо сейчас, не упоминай если не имеют отношения:\n{block}"
+            logger.info(f"🧠 [VECTOR+] Подмешал {len(hits)} факт(ов) в контекст: {' | '.join(h[:40] for h in hits)}")
+        else:
+            state_manager.state.pop("active_memory", None)
+            logger.info("🧠 [VECTOR-] Поискал, релевантных фактов нет — контекст чистый")
+
         initial_decision = await process_user_input(user_text, state_manager)
         
         decision = await _tool_loop(
@@ -623,24 +636,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 replies = [single_text]
                 
         if replies:
-            sent_count = 0
-            for i, message_text in enumerate(replies):
-                sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
-                if not sent:
-                    continue
-                await state_manager.add_history("model", message_text)
-                asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
-                sent_count += 1
-                if i < len(replies) - 1:
-                    await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
-                    next_len = len(replies[i+1])
-                    await asyncio.sleep(min(1.0 + next_len * 0.06, 3.0))
-            if not sent_count:
-                logger.info("💡<- [все реплики продублированы дедупом]")
+            if epoch != context.bot_data.get("gen_epoch", 0):
+                logger.info("🛑 генерация перебита (/stop или новое сообщение) — ответ не отправлен")
+            else:
+                sent_count = 0
+                for i, message_text in enumerate(replies):
+                    sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
+                    if not sent:
+                        continue
+                    await state_manager.add_history("model", message_text)
+                    sent_count += 1
+                    if i < len(replies) - 1:
+                        await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
+                        next_len = len(replies[i+1])
+                        await asyncio.sleep(min(1.0 + next_len * 0.06, 3.0))
+                if not sent_count:
+                    logger.info("💡<- [все реплики продублированы дедупом]")
         else:
             logger.info("💡<- [молчание]")
     finally:
         stop_typing.set()
+        if context.bot_data.get("gen_task") is asyncio.current_task():
+            context.bot_data["gen_task"] = None
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state_manager = context.bot_data["state_manager"]
@@ -679,7 +696,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"🎤-> Текст: {text}")
         await state_manager.add_history("user", f"[расшифровка голосового]: {text}")
-        asyncio.create_task(insert_to_rag(f"Пользователь [расшифровка голосового]: {text}", metadata=f"user_{user_id}"))
         await state_manager.update_interaction()
         
         initial_decision = await process_user_input(f"[расшифровка голосового]: {text}", state_manager)
@@ -712,7 +728,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not sent:
                     continue
                 await state_manager.add_history("model", message_text)
-                asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
                 sent_count += 1
                 if i < len(replies) - 1:
                     await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
@@ -798,7 +813,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"📄-> Файл сохранён: {candidate} ({len(downloaded)} байт)")
         await state_manager.add_history("user", f"[файл]: {candidate}")
-        asyncio.create_task(insert_to_rag(f"Пользователь отправил файл: {candidate}", metadata=f"user_{user_id}"))
         await state_manager.update_interaction()
 
         # Пропускаем через обычный конвейер, чтобы модель "знала" о файле
@@ -816,7 +830,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not sent:
                 continue
             await state_manager.add_history("model", message_text)
-            asyncio.create_task(insert_to_rag(f"Бот: {message_text}", metadata=f"bot_{user_id}"))
             if i < len(replies) - 1:
                 await context.bot.send_chat_action(chat_id=user_id, action=ChatAction.TYPING)
                 await asyncio.sleep(1.0)
@@ -836,7 +849,7 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
 
     # Обновление долгосрочного саммари каждые 50 сообщений
     try:
-        if state_manager.state.get("messages_since_summary", 0) >= 50:
+        if state_manager.state.get("messages_since_summary", 0) >= config.CHAT_HISTORY_LIMIT:
             await update_longterm_summary(state_manager)
     except Exception:
         logger.error("💥 [CRON] Ошибка в обновлении саммари!", exc_info=True)
@@ -1002,6 +1015,12 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     import bot_ai
     bot_ai.request_stop()
+    # Перебиваем любую генерацию, идущую в этот момент
+    if "gen_epoch" in context.bot_data:
+        context.bot_data["gen_epoch"] = context.bot_data.get("gen_epoch", 0) + 1
+    task = context.bot_data.get("gen_task")
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
     await update.message.reply_text("⏹ остановлено")
 
 
@@ -1107,127 +1126,25 @@ LLM_SECTIONS = {
         ("RAG_FALLBACK_KEY", "Фолбек Ключ"),
         ("RAG_FALLBACK_MODEL", "Фолбек Модель"),
     ]),
+    "embed": ("🔢 Эмбеддинги (память)", [
+        ("EMBED_URL", "URL"),
+        ("EMBED_KEY", "Ключ"),
+        ("EMBED_MODEL", "Модель"),
+        ("EMBED_FALLBACK_URL", "Фолбек URL"),
+        ("EMBED_FALLBACK_KEY", "Фолбек Ключ"),
+        ("EMBED_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
 }
 
-# Готовые провайдеры: имя -> (url, key, model)
-PROVIDERS = {
-    "alice": ("http://127.0.0.1:8000/v1", config.ALICE_KEY, "yandex-alice", config.PROXY_ALICE),
-    "gpt": ("http://127.0.0.1:5040/v1", config.GPT_KEY, "chatgpt", config.PROXY_GPT),
-    "deepseek": ("http://127.0.0.1:9655/v1", config.DEEPSEEK_KEY, "deepseek-chat", config.PROXY_DEEPSEEK),
-    "gemini": ("http://127.0.0.1:4984/v1", config.GEMINI_KEY, "gemini-3.6-flash", config.PROXY_GEMINI),
-    "g4f": ("https://g4f.space/api/gemini", "", "models/gemini-3.5-flash", config.PROXY_G4F),
-    "openrouter": ("https://openrouter.ai/api/v1", config.OPENROUTER_KEY, "minimax/minimax-m3:free", config.PROXY_OPENROUTER),
-}
-
-# Модели по провайдерам
-PROVIDER_MODELS = {
-    "g4f": [
-        ("models/gemini-3-flash-preview", "Gemini 3 Flash Preview"),
-        ("models/gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
-        ("models/gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite Preview"),
-        ("models/gemini-flash-latest", "Gemini Flash Latest"),
-        ("models/gemini-3.5-flash", "Gemini 3.5 Flash"),
-        ("models/gemini-3-pro-preview", "Gemini 3 Pro Preview"),
-        ("models/gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
-        ("models/gemini-2.5-flash", "Gemini 2.5 Flash"),
-        ("models/gemini-2.5-pro", "Gemini 2.5 Pro"),
-        ("models/gemini-2.0-flash", "Gemini 2.0 Flash"),
-        ("models/gemini-2.0-flash-001", "Gemini 2.0 Flash 001"),
-        ("models/gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite"),
-        ("models/gemini-2.0-flash-lite-001", "Gemini 2.0 Flash Lite 001"),
-        ("models/gemini-2.5-flash-preview-tts", "Gemini 2.5 Flash Preview TTS"),
-        ("models/gemini-2.5-pro-preview-tts", "Gemini 2.5 Pro Preview TTS"),
-        ("models/gemma-4-26b-a4b-it", "Gemma 4 26B"),
-        ("models/gemma-4-31b-it", "Gemma 4 31B"),
-        ("models/gemini-flash-lite-latest", "Gemini Flash Lite Latest"),
-        ("models/gemini-pro-latest", "Gemini Pro Latest"),
-        ("models/gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
-        ("models/gemini-2.5-flash-image", "Gemini 2.5 Flash Image"),
-        ("models/gemini-3.1-pro-preview-customtools", "Gemini 3.1 Pro Custom Tools"),
-        ("models/gemini-3.1-flash-lite-image", "Gemini 3.1 Flash Lite Image"),
-        ("models/gemini-3-pro-image-preview", "Gemini 3 Pro Image Preview"),
-        ("models/gemini-3-pro-image", "Gemini 3 Pro Image"),
-        ("models/gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image Preview"),
-        ("models/gemini-3.1-flash-image", "Gemini 3.1 Flash Image"),
-        ("models/gemini-3.1-flash-tts-preview", "Gemini 3.1 Flash TTS"),
-        ("models/gemini-omni-flash-preview", "Gemini Omni Flash"),
-        ("models/gemini-3.5-live-translate-preview", "Gemini 3.5 Live Translate"),
-        ("models/gemini-3.1-flash-live-preview", "Gemini 3.1 Flash Live"),
-    ],
-    "openrouter": [
-        ("minimax/minimax-m3:free", "MiniMax M3 (free)"),
-    ],
-    "deepseek": [
-        ("deepseek-chat", "DeepSeek Chat"),
-        ("deepseek-reasoner", "DeepSeek Reasoner"),
-    ],
-    "gemini": [
-        ("gemini-3.6-flash", "Gemini 3.6 Flash"),
-        ("gemini-3.5-flash", "Gemini 3.5 Flash"),
-        ("gemini-3.5-flash-thinking", "Gemini 3.5 Flash Thinking"),
-        ("gemini-3.5-flash-thinking-lite", "Gemini 3.5 Flash Thinking Lite"),
-        ("gemini-3.1-pro", "Gemini 3.1 Pro"),
-        ("gemini-3.1-pro-enhanced", "Gemini 3.1 Pro Enhanced"),
-        ("gemini-auto", "Gemini Auto"),
-        ("gemini-flash-lite", "Gemini Flash Lite"),
-    ],
-    "alice": [
-        ("yandex-alice", "Yandex Alice"),
-    ],
-    "gpt": [
-        ("chatgpt", "ChatGPT"),
-    ],
-}
-
-# Динамическая загрузка free-моделей OpenRouter
-import urllib.request
-import json as _json
-
-def _load_openrouter_free_models():
-    """Загружает список бесплатных моделей с OpenRouter."""
-    try:
-        proxy_str = config.PROXY_OPENROUTER or config.PROXY_G4F
-        proxy = config.parse_proxy(proxy_str) if proxy_str else None
-        if proxy:
-            proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
-            opener = urllib.request.build_opener(proxy_handler)
-        else:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        req = urllib.request.Request("https://openrouter.ai/api/v1/models")
-        resp = opener.open(req, timeout=15)
-        data = _json.loads(resp.read().decode("utf-8"))
-        free = [m for m in data.get("data", []) if ":free" in m["id"]]
-        models = [(m["id"], m["id"].split("/")[-1].replace(":free", "")) for m in sorted(free, key=lambda x: x["id"])]
-        if models:
-            PROVIDER_MODELS["openrouter"] = models
-            # Маппинг индекс → model_id для кнопок (Telegram лимит 64 байта)
-            OPENROUTER_MODEL_MAP.clear()
-            for i, (model_id, _) in enumerate(models):
-                OPENROUTER_MODEL_MAP[str(i)] = model_id
-            logger.info(f"✅ [OPENROUTER] Загружено {len(models)} free-моделей")
-    except Exception as e:
-        logger.warning(f"⚠️ [OPENROUTER] Не удалось загрузить модели: {e}")
-
-OPENROUTER_MODEL_MAP = {}
-_load_openrouter_free_models()
-
-# Маппинг секции -> ключи config.py для (url, key, model)
-SECTION_KEYS = {
-    "main": ("G4F_URL", "G4F_KEY", "G4F_MODEL"),
-    "search": ("SEARCH_PROXY_URL", "SEARCH_PROXY_KEY", "SEARCH_MODEL"),
-    "summary": ("SUMMARY_PROXY_URL", "SUMMARY_PROXY_KEY", "SUMMARY_MODEL"),
-    "reflection": ("REFLECTION_PROXY_URL", "REFLECTION_PROXY_KEY", "REFLECTION_MODEL"),
-    "rag": ("RAG_URL", "RAG_KEY", "RAG_MODEL"),
-}
-
-# Фолбеки: секция -> (url_key, key_key, model_key)
-FALLBACK_KEYS = {
-    "main": ("MAIN_FALLBACK_URL", "MAIN_FALLBACK_KEY", "MAIN_FALLBACK_MODEL"),
-    "search": ("SEARCH_FALLBACK_URL", "SEARCH_FALLBACK_KEY", "SEARCH_FALLBACK_MODEL"),
-    "summary": ("SUMMARY_FALLBACK_URL", "SUMMARY_FALLBACK_KEY", "SUMMARY_FALLBACK_MODEL"),
-    "reflection": ("REFLECTION_FALLBACK_URL", "REFLECTION_FALLBACK_KEY", "REFLECTION_FALLBACK_MODEL"),
-    "rag": ("RAG_FALLBACK_URL", "RAG_FALLBACK_KEY", "RAG_FALLBACK_MODEL"),
-}
+# Провайдеры, модели, секции и фолбеки — ЕДИНСТВЕННЫЙ источник: providers.py
+from providers import (
+    PROVIDERS,
+    PROVIDER_MODELS,
+    OPENROUTER_MODEL_MAP,
+    SECTION_KEYS,
+    FALLBACK_KEYS,
+    PROXY_ENV_KEYS,
+)
 
 async def handle_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает текущие настройки LLM и кнопки для редактирования."""
@@ -1262,10 +1179,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
 
         # Текущие значения
-        current_url = getattr(config, url_key, "—")
-        current_model = getattr(config, model_key, "—")
-        current_fb_url = getattr(config, fb_url_key, "")
-        current_fb_model = getattr(config, fb_model_key, "")
+        current_url = getattr(providers, url_key, "—")
+        current_model = getattr(providers, model_key, "—")
+        current_fb_url = getattr(providers, fb_url_key, "")
+        current_fb_model = getattr(providers, fb_model_key, "")
 
         # Определяем текущий провайдер
         current_provider = "custom"
@@ -1303,8 +1220,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("llm_main:"):
         section = data.split(":", 1)[1]
         url_key, key_key, model_key = SECTION_KEYS[section]
-        current_url = getattr(config, url_key, "—")
-        current_model = getattr(config, model_key, "—")
+        current_url = getattr(providers, url_key, "—")
+        current_model = getattr(providers, model_key, "—")
 
         current_provider = "custom"
         for prov_name, (prov_url, prov_key, prov_model, _) in PROVIDERS.items():
@@ -1332,8 +1249,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("llm_fb:"):
         section = data.split(":", 1)[1]
         fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
-        current_fb_url = getattr(config, fb_url_key, "")
-        current_fb_model = getattr(config, fb_model_key, "")
+        current_fb_url = getattr(providers, fb_url_key, "")
+        current_fb_model = getattr(providers, fb_model_key, "")
 
         current_fb_provider = "не настроен"
         if current_fb_url:
@@ -1393,11 +1310,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Показываем модели провайдера
         models = PROVIDER_MODELS.get(prov_name, [])
-        current_model = getattr(config, model_key, "—")
+        current_model = getattr(providers, model_key, "—")
 
         # Текущий прокси провайдера
-        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
-        current_proxy = getattr(config, proxy_env_key, "") if proxy_env_key else ""
+        proxy_env_key = PROXY_ENV_KEYS.get(prov_name, "")
+        current_proxy = getattr(providers, proxy_env_key, "") if proxy_env_key else ""
         proxy_status = f"`{current_proxy}`" if current_proxy else "нет"
 
         text = f"{LLM_SECTIONS[section][0]} — {prov_name.upper()}\n\n"
@@ -1477,7 +1394,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fb_url_key, fb_key_key, fb_model_key = FALLBACK_KEYS[section]
 
         models = PROVIDER_MODELS.get(prov_name, [])
-        current_fb_model = getattr(config, fb_model_key, "")
+        current_fb_model = getattr(providers, fb_model_key, "")
 
         text = f"{LLM_SECTIONS[section][0]} — фолбек {prov_name.upper()}\n\n"
         text += f"URL: `{prov_url}`\n\n"
@@ -1571,7 +1488,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("llm_edit:"):
         config_key = data.split(":", 1)[1]
-        current = str(getattr(config, config_key, ""))
+        current = str(getattr(providers, config_key, ""))
         await query.edit_message_text(
             f"✏️ `{config_key}`\n\nтекущее: `{current}`\n\n"
             f"напиши новое значение:",
@@ -1590,9 +1507,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             url_key, _, model_key = SECTION_KEYS[key]
             fb_url_key, _, fb_model_key = FALLBACK_KEYS[key]
 
-            current_url = getattr(config, url_key, "")
-            current_model = getattr(config, model_key, "")
-            current_fb_url = getattr(config, fb_url_key, "")
+            current_url = getattr(providers, url_key, "")
+            current_model = getattr(providers, model_key, "")
+            current_fb_url = getattr(providers, fb_url_key, "")
 
             # Определяем имя провайдера
             provider_name = "custom"
@@ -1605,7 +1522,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_fb_url:
                 fb_name = "custom"
                 for pn, (pu, _, pm, __) in PROVIDERS.items():
-                    if current_fb_url == pu and getattr(config, fb_model_key, "") == pm:
+                    if current_fb_url == pu and getattr(providers, fb_model_key, "") == pm:
                         fb_name = pn
                         break
 
@@ -1618,10 +1535,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- УПРАВЛЕНИЕ ПРОКСИ ---
     elif data.startswith("proxy:"):
         prov_name = data.split(":", 1)[1]
-        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
+        proxy_env_key = PROXY_ENV_KEYS.get(prov_name, "")
         if not proxy_env_key:
             return
-        current_proxy = getattr(config, proxy_env_key, "")
+        current_proxy = getattr(providers, proxy_env_key, "")
 
         # Загружаем сохранённые прокси
         try:
@@ -1650,7 +1567,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         prov_name = parts[1]
         mode = parts[2]
-        proxy_env_key = config.PROXY_ENV_KEYS.get(prov_name, "")
+        proxy_env_key = PROXY_ENV_KEYS.get(prov_name, "")
         if not proxy_env_key:
             return
 
@@ -1711,7 +1628,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prov_name = data.split(":", 1)[1]
         # Возвращаемся к списку провайдеров секции
         for section, (url_key, _, _) in SECTION_KEYS.items():
-            url_val = getattr(config, url_key, "")
+            url_val = getattr(providers, url_key, "")
             for pn, (pu, _, _, _) in PROVIDERS.items():
                 if pn == prov_name and url_val == pu:
                     # Имитируем callback "prov:section:prov_name"

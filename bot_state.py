@@ -85,7 +85,7 @@ class StateManager:
         new_message = {"role": role, "content": text, "ts": ts}
         # Краткосрочная память для промпта
         self.state["chat_history"].append(new_message)
-        self.state["chat_history"] = self.state["chat_history"][-50:]
+        self.state["chat_history"] = self.state["chat_history"][-config.CHAT_HISTORY_LIMIT:]
         
         # Долгосрочная память для рефлексии
         self.state.setdefault("reflection_history", []).append(new_message)
@@ -103,7 +103,7 @@ class StateManager:
         ts = datetime.datetime.now(msk).strftime("%H:%M")
         new_message = {"role": "tool", "content": record_text, "ts": ts}
         self.state["chat_history"].append(new_message)
-        self.state["chat_history"] = self.state["chat_history"][-50:]
+        self.state["chat_history"] = self.state["chat_history"][-config.CHAT_HISTORY_LIMIT:]
         self.state["messages_since_summary"] = self.state.get("messages_since_summary", 0) + 1
         await self.save()
 
@@ -245,11 +245,15 @@ class StateManager:
         return "\n".join([f"[{m.get('ts','')}] {'Юзер' if m['role']=='user' else 'Бот'}: {m['content']}" for m in recent])
             
     def get_total_mood(self):
-        return max(0.05, self.state["base_mood"] + self.state["spike"] + self.state["residual"])
+        return max(0.0, self.state["base_mood"] + self.state["spike"] + self.state["residual"])
 
     async def apply_reaction(self, shift):
         self.state["spike"] += shift
         self.state["residual"] += (shift * 0.5)
+        # Не давать суммарному настроению уходить ниже нуля
+        low = self.state["base_mood"] + self.state["spike"] + self.state["residual"]
+        if low < 0.0:
+            self.state["spike"] -= low
         await self.save()
         logger.info(f"💥 [REACTION] Shift: {shift:+.2f} | Total: {self.get_total_mood():.2f}")
 

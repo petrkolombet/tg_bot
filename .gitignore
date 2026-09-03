@@ -2,6 +2,10 @@
 *.env
 .env.bak*
 *.bak
+*.bak-*
+last_gemini_prompt.txt
+last_raw_response.txt
+saved_proxies.json
 __pycache__/
 *.pyc
 state.json
