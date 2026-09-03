@@ -57,29 +57,93 @@ def _flatten_replies(replies):
 _last_sent_text: dict = {}
 
 
+def _md_to_mdv2(text):
+    """Конвертирует обычный Markdown в MarkdownV2 для Telegram и экранирует
+    служебные символы вне конструкций. Поддерживает: **жирный**, *курсив*,
+    ***жирный курсив***, ~~зачёркнутый~~, `код`, ```блок кода```, > цитата,
+    [ссылка](url). Списки не поддерживаются Telegram MarkdownV2."""
+    import re as _re
+
+    if not text:
+        return text
+
+    tokens = []
+
+    def _hold(m):
+        tokens.append(m.group(0))
+        return f"\x00{len(tokens)-1}\x00"
+
+    s = text
+
+    # 1) блоки кода: ```lang ... ```
+    s = _re.sub(r'```[\w-]*\n?.*?```', _hold, s, flags=_re.S)
+    # 2) инлайн-код `...`
+    s = _re.sub(r'`[^`\n]+`', _hold, s)
+    # 3) ссылки [текст](url)
+    s = _re.sub(r'\[[^\[\]\n]+\]\([^()\n]+\)', _hold, s)
+    # 4) жирный курсив ***...*** → *_..._* (Telegram V2: жирный оборачивает курсив)
+    s = _re.sub(r'\*{3}([^*]+)\*{3}', lambda m: tokens.append("*_" + m.group(1) + "_*") or f"\x00{len(tokens)-1}\x00", s)
+    # 5) жирный **...** → *...* (Telegram V2: жирный = *)
+    s = _re.sub(r'\*{2}([^*]+)\*{2}', lambda m: tokens.append("*" + m.group(1) + "*") or f"\x00{len(tokens)-1}\x00", s)
+    # 6) underline __...__
+    s = _re.sub(r'_{2}([^_\n]+)_{2}', _hold, s)
+    # 7) курсив *...*
+    s = _re.sub(r'\*([^*\n]+)\*', lambda m: tokens.append("_" + m.group(1) + "_") or f"\x00{len(tokens)-1}\x00", s)
+    # 8) курсив _..._ (если вход уже в Telegram-стиле)
+    s = _re.sub(r'(?<!_)_{1}([^_\n]+)_{1}(?!_)', _hold, s)
+    # 9) зачёркнутый ~~...~~
+    s = _re.sub(r'~{2}([^~\n]+)~{2}', lambda m: tokens.append("~" + m.group(1) + "~") or f"\x00{len(tokens)-1}\x00", s)
+    # 8) списки * item / - item → — item (Telegram не поддерживает списки, long dash — не спецсимвол)
+    s = _re.sub(r'(?m)^(\s*)[*-]\s+', r'\1— ', s)
+
+    # Экранируем служебные символы MarkdownV2 вне плейсхолдеров
+    # Списки в Telegram MarkdownV2 не поддерживаются — все спецсимволы экранируются
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\x00":
+            j = s.index("\x00", i + 1)
+            idx = int(s[i + 1:j])
+            out.append(tokens[idx])
+            i = j + 1
+            continue
+        if ch == ">" and (i == 0 or s[i - 1] == "\n"):
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "_*[]()~`>#+-=|{}.!":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 async def _send_md(update_or_ctx, chat_id, text, reply_to_message_id=None):
-    """Отправка с рендером Markdown + дедуп. Если текст дословно равен последнему
-    отправленному в этот чат — пропускаем (False). Если Markdown невалиден
+    """Отправка с рендером MarkdownV2 + дедуп. Если текст дословно равен последнему
+    отправленному в этот чат — пропускаем (False). Если MarkdownV2 невалиден
     (Telegram бросит Bad Request) — отправляем чистым текстом без parse_mode."""
     if text and text == _last_sent_text.get(chat_id):
         logger.info(f"⏭️ [DEDUP] Пропускаю дубль сообщения: {text[:80]}")
         return False
+    _md = _md_to_mdv2(text) if text else text
     try:
         await update_or_ctx.bot.send_message(
             chat_id=chat_id,
-            text=text,
-            parse_mode="Markdown",
+            text=_md,
+            parse_mode="MarkdownV2",
             reply_to_message_id=reply_to_message_id,
         )
-    except Exception:
-        logger.warning("⚠️ [SEND] Markdown битый, отправляю plain text")
+    except Exception as e:
+        logger.warning(f"⚠️ [SEND] MarkdownV2 битый: {e}, отправляю plain text")
         await update_or_ctx.bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_to_message_id=reply_to_message_id,
         )
-    _last_sent_text[chat_id] = text
-    logger.info(f"💡<- {text}")
+    _last_sent_text[chat_id] = _md
+    logger.info(f"💡<- {_md}")
     return True
 
 

@@ -99,10 +99,17 @@ _WINDOW_EXTRACTION_PROMPT = """Ты — аккуратный агент запи
 
 Если во всём окне нет ни одного подтвержденного стойкого факта — верни memories: []. Лучше ничего, чем мусор.
 
+ВНИМАНИЕ — СУЩЕСТВУЮЩИЕ ФАКТЫ УЖЕ В БАЗЕ:
+В поле existing_facts (в конце запроса) перечислены все факты, УЖЕ сохранённые в памяти, каждый со своим id.
+ТВОЯ ЗАДАЧА — НЕ создавать дубликаты и не плодить противоречия:
+- Если новый факт из окна по смыслу УЖЕ отражён в существующем — НЕ создавай новый объект memories для него.
+- Если новый факт ОБНОВЛЯЕТ/ЗАМЕНЯЕТ существующий (например, статус сменился: было «ещё не проверено», стало «работает»; или уточнил/исправил прошлое) — создай один объект memories с актуальным содержанием И укажи supersedes_memory_id = id того существующего факта, который он заменяет. Старый факт после этого будет удалён.
+- Если новый факт — это что-то принципиально новое, не касающееся существующих фактов, supersedes_memory_id оставь null.
+
 Верни строгий JSON с ключами:
 state_patch (object, можно пустой {}), memories (list[object]).
 
-Каждый объект memories обязан содержать: scope, scope_id_key, kind, content, summary, tags, importance, confidence.
+Каждый объект memories обязан содержать: scope, scope_id_key, kind, content, summary, tags, importance, confidence, supersedes_memory_id.
 - scope_id_key — одно из значений ровно: session, user, project.
 - kind — одно из:
   • fact — реальный стойкий факт о пользователе или боте (профессия, место жительства, черта характера, возможности).
@@ -112,6 +119,7 @@ state_patch (object, можно пустой {}), memories (list[object]).
   • task_state — текущая задача/план в процессе (в работе, ожидает, сделано).
 - importance — число от 0 до 1 (насколько это важно помнить долго; 0.9+ для очень важного).
 - confidence — число от 0 до 1.
+- supersedes_memory_id — int id существующего факта, который этот факт заменяет (или null, если никого не заменяет).
 
 ПРИМЕР ПРАВИЛЬНОГО JSON-ВЫВОДА (заполни по аналогии, верни ровно такую структуру):
 {
@@ -125,7 +133,8 @@ state_patch (object, можно пустой {}), memories (list[object]).
       "summary": "предпочитает краткие ответы",
       "tags": ["предпочтения"],
       "importance": 0.85,
-      "confidence": 0.8
+      "confidence": 0.8,
+      "supersedes_memory_id": null
     }
   ]
 }
@@ -143,6 +152,9 @@ _ORIG_EXTRACT = ModelMemoryController.extract_memories
 
 
 def _patched_extract_memories(self, session_id, user_message, assistant_message, recent_messages, existing_state, scope_ids):
+    existing_facts = []
+    if isinstance(existing_state, dict):
+        existing_facts = existing_state.pop("__existing_facts__", []) or []
     try:
         payload = self.client.complete_json(
             system_prompt=_WINDOW_EXTRACTION_PROMPT,
@@ -151,6 +163,7 @@ def _patched_extract_memories(self, session_id, user_message, assistant_message,
                 f"assistant_message={assistant_message!r}\n"
                 f"recent_messages={[{'role': m.role, 'content': m.content[:120]} for m in recent_messages[-self.config.recent_prompt_window:]]!r}\n"
                 f"existing_state={existing_state!r}\n"
+                f"existing_facts={existing_facts!r}\n"
                 f"scope_ids={scope_ids!r}"
             ),
         )
@@ -173,6 +186,12 @@ def _patched_extract_memories(self, session_id, user_message, assistant_message,
         )
         if memory is None:
             continue
+        try:
+            sid = item.get("supersedes_memory_id")
+            if isinstance(sid, (int, float)) and not isinstance(sid, bool):
+                memory.supersedes_memory_id = int(sid)
+        except Exception:
+            pass
         key = (memory.scope, memory.scope_id, memory.kind, memory.content.lower())
         if key in seen:
             continue
@@ -339,10 +358,13 @@ def _get_agent():
     return _agent
 
 
-async def remember_window(messages, session_id="tg_bot_main"):
+async def remember_window(messages, session_id="tg_bot_main", max_facts=50):
     """Пакетно извлекает важные факты из окна диалога и записывает в память.
     messages — список строк вида «Пользователь: …» / «Бот: …».
-    Запускается вместе с триггером саммари, а не на каждое сообщение."""
+    Запускается вместе с триггером саммари, а не на каждое сообщение.
+    max_facts — жёсткий лимит фактов в БД: всё влезает в промпт извлекателя,
+    поэтому он видит существующие факты с id и НЕ дублирует, а через
+    supersedes_memory_id обновляет/заменяет устаревшие."""
     try:
         text = "\n".join(messages) if messages else ""
         if not text.strip():
@@ -351,14 +373,25 @@ async def remember_window(messages, session_id="tg_bot_main"):
         agent = _get_agent()
         scope_ids = {"session": session_id}
 
+        def _load_existing_facts():
+            rows = agent.store.conn.execute(
+                "SELECT id, kind, content, summary FROM memories WHERE scope = ? AND scope_id = ? ORDER BY importance DESC, updated_at DESC LIMIT ?",
+                ("session", session_id, max_facts),
+            ).fetchall()
+            return [{"id": int(r["id"]), "kind": r["kind"], "content": r["content"], "summary": r["summary"]} for r in rows]
+
         def _apply():
             try:
+                existing_facts = _load_existing_facts()
+                state = agent.get_state("session", session_id) or {}
+                state = dict(state)
+                state["__existing_facts__"] = existing_facts
                 result = agent.controller.extract_memories(
                     session_id=session_id,
                     user_message=text,
                     assistant_message="",
                     recent_messages=[],
-                    existing_state=agent.get_state("session", session_id),
+                    existing_state=state,
                     scope_ids=scope_ids,
                 )
             except Exception as e:
@@ -368,18 +401,43 @@ async def remember_window(messages, session_id="tg_bot_main"):
             if not memories:
                 logger.info("🧠 [MEMORY] Окно: значимых фактов не найдено, память не пополнена")
                 return
+            supersedes = [m.supersedes_memory_id for m in memories if m.supersedes_memory_id]
             embeddings = _embed_batch([m.content for m in memories])
             agent.store.persist_extraction(
                 memories, [],
                 embeddings_model=_embed_model(),
                 memory_embeddings=embeddings or None,
             )
+            try:
+                if supersedes:
+                    agent.store._delete_memories(supersedes)
+            except Exception as e:
+                logger.error(f"⚠️ remember_window: не удалил заменённые факты {supersedes}: {e}")
+            _enforce_fact_cap(agent, session_id, max_facts)
             for m in memories:
-                logger.info(f"🧠 [MEMORY] СОХРАНЕНО: {m.content}")
+                logger.info(f"🧠 [MEMORY] СОХРАНЕНО: {m.content}" + (f" (заменён id {m.supersedes_memory_id})" if m.supersedes_memory_id else ""))
 
         await loop.run_in_executor(None, _apply)
     except Exception as e:
         logger.error(f"❌ Ошибка remember_window: {e}")
+
+
+def _enforce_fact_cap(agent, session_id, max_facts):
+    """Если фактов в БД больше max_facts — удаляет лишние по важности (наименее важные).
+    Позволяет держать базу в пределах лимита, чтобы все факты влезали в промпт извлекателя."""
+    try:
+        rows = agent.store.conn.execute(
+            "SELECT id FROM memories WHERE scope = ? AND scope_id = ? ORDER BY importance DESC, updated_at DESC",
+            ("session", session_id),
+        ).fetchall()
+        total = len(rows)
+        if total <= max_facts:
+            return
+        to_delete = [int(r["id"]) for r in rows[max_facts:]]
+        agent.store._delete_memories(to_delete)
+        logger.info(f"🧠 [MEMORY] Лимит {max_facts}: удалено {len(to_delete)} наименее важных фактов")
+    except Exception as e:
+        logger.error(f"⚠️ remember_window: сбой применения лимита фактов: {e}")
 
 
 async def vector_search(query_text, top_k=5, threshold=0.30):

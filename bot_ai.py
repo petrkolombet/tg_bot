@@ -616,7 +616,8 @@ async def search_web_g4f(query):
     return None
 
 async def search_web(query):
-    logger.info(f"🔍 [SEARCH] Поиск: {query}")
+    _sn = providers.get_provider_name(providers.SEARCH_PROXY_URL)
+    logger.info(f"🔍 [SEARCH-{_sn}] Поиск: {query}")
     payload = json.dumps({
         "model": providers.SEARCH_MODEL,
         "messages": [
@@ -646,10 +647,10 @@ async def search_web(query):
             text = data["choices"][0]["message"]["content"]
             text = re.sub(r'\[citation:\d+\]', '', text)
             text = re.sub(r'\s+([.,;:!?])', r'\1', text).strip()
-            logger.info(f"🔍 [SEARCH] Результат: {len(text)} символов")
+            logger.info(f"✅🔍 [SEARCH-{_sn}] Результат: {len(text)} символов")
             return text
         except Exception as e:
-            logger.error(f"❌ [SEARCH] Ошибка (попытка {attempt+1}): {e}")
+            logger.error(f"❌🔍 [SEARCH-{_sn}] Ошибка (попытка {attempt+1}): {e}")
             if attempt < 1:
                 await asyncio.sleep(2)
 
