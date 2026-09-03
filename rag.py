@@ -105,6 +105,7 @@ _WINDOW_EXTRACTION_PROMPT = """Ты — аккуратный агент запи
 - Если новый факт из окна по смыслу УЖЕ отражён в существующем — НЕ создавай новый объект memories для него.
 - Если новый факт ОБНОВЛЯЕТ/ЗАМЕНЯЕТ существующий (например, статус сменился: было «ещё не проверено», стало «работает»; или уточнил/исправил прошлое) — создай один объект memories с актуальным содержанием И укажи supersedes_memory_id = id того существующего факта, который он заменяет. Старый факт после этого будет удалён.
 - Если новый факт — это что-то принципиально новое, не касающееся существующих фактов, supersedes_memory_id оставь null.
+- ПРИОРИТЕТ ЗАДАЧ (task_state/task): задачи и планы устаревают чаще всего. Если в окне видно, что существующая в базе задача (kind=task_state или task) изменила состояние (сначала «в работе/ожидает» → позже «сделано/готово/работает/отменено»), — ОБЯЗАТЕЛЬНО замени её: создай новый объект с актуальным статусом и supersedes_memory_id = id прежней задачи. Не оставляй в базе устаревшую задачу рядом с новой — задачи держи в актуальном состоянии в первую очередь. Если задача совсем закрыта и больше не актуальна — всё равно верни её замену (объект с финальным статусом «сделано/закрыто») с supersedes_memory_id, чтобы старый устаревший экземпляр был удалён из базы.
 
 Верни строгий JSON с ключами:
 state_patch (object, можно пустой {}), memories (list[object]).
@@ -422,20 +423,33 @@ async def remember_window(messages, session_id="tg_bot_main", max_facts=50):
         logger.error(f"❌ Ошибка remember_window: {e}")
 
 
+TASK_KINDS = {"task", "task_state"}
+
+
 def _enforce_fact_cap(agent, session_id, max_facts):
-    """Если фактов в БД больше max_facts — удаляет лишние по важности (наименее важные).
+    """Если фактов в БД больше max_facts — удаляет лишние.
+    Приоритет удаления: сначала задачи (task/task_state) по важности (наименее важные первыми),
+    затем остальные факты по важности. Задачи устаревают быстро, поэтому выкидываются в первую очередь.
     Позволяет держать базу в пределах лимита, чтобы все факты влезали в промпт извлекателя."""
     try:
         rows = agent.store.conn.execute(
-            "SELECT id FROM memories WHERE scope = ? AND scope_id = ? ORDER BY importance DESC, updated_at DESC",
+            "SELECT id, kind, importance, updated_at FROM memories WHERE scope = ? AND scope_id = ?",
             ("session", session_id),
         ).fetchall()
         total = len(rows)
         if total <= max_facts:
             return
-        to_delete = [int(r["id"]) for r in rows[max_facts:]]
+
+        def sort_key(r):
+            is_task = 0 if r["kind"] in TASK_KINDS else 1
+            imp = r["importance"] or 0
+            upd = r["updated_at"] or 0
+            return (is_task, imp, upd)
+
+        ordered = sorted(rows, key=sort_key, reverse=True)
+        to_delete = [int(r["id"]) for r in ordered[max_facts:]]
         agent.store._delete_memories(to_delete)
-        logger.info(f"🧠 [MEMORY] Лимит {max_facts}: удалено {len(to_delete)} наименее важных фактов")
+        logger.info(f"🧠 [MEMORY] Лимит {max_facts}: удалено {len(to_delete)} фактов (сначала задачи)")
     except Exception as e:
         logger.error(f"⚠️ remember_window: сбой применения лимита фактов: {e}")
 

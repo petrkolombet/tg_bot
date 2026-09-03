@@ -1151,9 +1151,9 @@ def _write_env(updates: dict):
 # Секции моделей: ключ -> (название, [(config_key, label), ...])
 LLM_SECTIONS = {
     "main": ("🧠 Основная генерация", [
-        ("G4F_URL", "URL"),
-        ("G4F_KEY", "Ключ"),
-        ("G4F_MODEL", "Модель"),
+        ("MAIN_URL", "URL"),
+        ("MAIN_KEY", "Ключ"),
+        ("MAIN_MODEL", "Модель"),
         ("MAIN_FALLBACK_URL", "Фолбек URL"),
         ("MAIN_FALLBACK_KEY", "Фолбек Ключ"),
         ("MAIN_FALLBACK_MODEL", "Фолбек Модель"),

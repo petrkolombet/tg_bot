@@ -123,9 +123,14 @@ ALICE_KEY = _env("ALICE_KEY", "sk-alice")
 DEEPSEEK_KEY = _env("DEEPSEEK_KEY", "sk-freedeepseek")
 GPT_KEY = _env("GPT_KEY", "anon")
 
-# --- Основная генерация (main) ---
+# --- Основная генерация (main) — собственные переменные секции ---
+MAIN_URL = _env("MAIN_URL", "https://g4f.space/api/gemini")
+MAIN_KEY = _env("MAIN_KEY", "")
+MAIN_MODEL = _env("MAIN_MODEL", "models/gemini-flash-latest")
+
+# --- Провайдер g4f.space (отдельные переменные, отвязаны от секции main) ---
 G4F_URL = _env("G4F_URL", "https://g4f.space/api/gemini")
-G4F_KEY = _env("G4F_KEY", "")
+G4F_KEY = _env("G4F_KEY", "anon")
 G4F_MODEL = _env("G4F_MODEL", "models/gemini-3.5-flash")
 
 # --- Прокси провайдеров (host:port:user:pass или пусто) ---
@@ -304,7 +309,7 @@ _load_openrouter_free_models()
 
 # Маппинг секции -> env-ключи (url, key, model)
 SECTION_KEYS = {
-    "main": ("G4F_URL", "G4F_KEY", "G4F_MODEL"),
+    "main": ("MAIN_URL", "MAIN_KEY", "MAIN_MODEL"),
     "search": ("SEARCH_PROXY_URL", "SEARCH_PROXY_KEY", "SEARCH_MODEL"),
     "summary": ("SUMMARY_PROXY_URL", "SUMMARY_PROXY_KEY", "SUMMARY_MODEL"),
     "reflection": ("REFLECTION_PROXY_URL", "REFLECTION_PROXY_KEY", "REFLECTION_MODEL"),

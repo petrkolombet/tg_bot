@@ -21,12 +21,13 @@ import time
 from urllib.request import Request, build_opener, HTTPBasicAuthHandler, ProxyHandler
 
 import config
+import providers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("cake_baker")
 
 CAKE_URL = "https://g4f.space/cake"
-PROXY = config.PROXY_G4F  # idem config; задачи на одном IP
+PROXY = providers.parse_proxy(providers.PROXY_G4F) or None  # host:port:user:pass → http://user:pass@host:port
 BATCH = 5                 # UUID за цикл (server caps at 50)
 SLEEP_BETWEEN = 20        # сек между циклами (не долбим прокси)
 SLEEP_AFTER_LIMIT = 3600  # сек сна при дневном лимите

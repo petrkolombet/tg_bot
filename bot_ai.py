@@ -253,12 +253,12 @@ async def safe_generate_content(prompt, temperature=0.85, image_path=None):
     """Генерация с фолбеком: основной провайдер → MAIN_FALLBACK."""
     if is_stopped():
         return None
-    provider = providers.get_provider_name(providers.G4F_URL)
+    provider = providers.get_provider_name(providers.MAIN_URL)
     # Определяем прокси по URL провайдера
     proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
     proxy = getattr(providers, proxy_key, "") if proxy_key else ""
     result = await _try_generate(
-        providers.G4F_URL, providers.G4F_KEY, providers.G4F_MODEL,
+        providers.MAIN_URL, providers.MAIN_KEY, providers.MAIN_MODEL,
         prompt, temperature, image_path, provider, attempt_limit=4, proxy=proxy
     )
     if result:
