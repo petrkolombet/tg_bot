@@ -16,7 +16,7 @@ import config
 import providers
 import server_access
 import tools_registry
-from bot_ai import summarize_tool_output
+from bot_ai import summarize_tool_output, IMAGE_EXTS
 from rag import vector_search
 
 logger = logging.getLogger(__name__)
@@ -900,9 +900,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await state_manager.add_history("user", f"[файл]: {candidate}")
         await state_manager.update_interaction()
 
-        # Пропускаем через обычный конвейер, чтобы модель "знала" о файле
-        initial_decision = await process_user_input(f"[файл]: {candidate}", state_manager)
-        decision = await _tool_loop(update, context, state_manager, f"[файл]: {candidate}", initial_decision)
+        # Если с файлом/фото был текст (caption) — обрабатывается как обычно,
+        # а файл передаётся отдельно через image_path (только для картинок).
+        caption = (msg.caption or "").strip()
+        is_image = (msg.photo is not None or os.path.splitext(candidate)[1].lower() in IMAGE_EXTS)
+        input_text = caption if caption else f"[файл]: {candidate}"
+        image_path_arg = candidate if (caption and is_image) else None
+
+        initial_decision = await process_user_input(input_text, state_manager, image_path=image_path_arg)
+        decision = await _tool_loop(update, context, state_manager, input_text, initial_decision)
 
         if not decision:
             return
@@ -1226,6 +1232,14 @@ LLM_SECTIONS = {
         ("TRANSCRIBE_FALLBACK_URL", "Фолбек URL"),
         ("TRANSCRIBE_FALLBACK_KEY", "Фолбек Ключ"),
         ("TRANSCRIBE_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
+    "image": ("🖼️ Фото (картинки)", [
+        ("IMAGE_URL", "URL"),
+        ("IMAGE_KEY", "Ключ"),
+        ("IMAGE_MODEL", "Модель"),
+        ("IMAGE_FALLBACK_URL", "Фолбек URL"),
+        ("IMAGE_FALLBACK_KEY", "Фолбек Ключ"),
+        ("IMAGE_FALLBACK_MODEL", "Фолбек Модель"),
     ]),
 }
 
@@ -1595,34 +1609,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             buttons.append([InlineKeyboardButton(name, callback_data=f"llm:{key}")])
         markup = InlineKeyboardMarkup(buttons)
 
-        text = "⚙️ настройки LLM\n\n"
-        for key, (name, _) in LLM_SECTIONS.items():
-            url_key, _, model_key = SECTION_KEYS[key]
-            fb_url_key, _, fb_model_key = FALLBACK_KEYS[key]
-
-            current_url = getattr(providers, url_key, "")
-            current_model = getattr(providers, model_key, "")
-            current_fb_url = getattr(providers, fb_url_key, "")
-
-            # Определяем имя провайдера по URL
-            provider_name = "custom"
-            for pn, (pu, _, _) in PROVIDERS.items():
-                if current_url == pu:
-                    provider_name = pn
-                    break
-
-            fb_name = "выкл"
-            if current_fb_url:
-                fb_name = "custom"
-                for pn, (pu, _, _) in PROVIDERS.items():
-                    if current_fb_url == pu:
-                        fb_name = pn
-                        break
-
-            text += f"{name}\n"
-            text += f"  ⚡ {provider_name.upper()}: `{current_model}`\n"
-            text += f"  🔁 фолбек: {fb_name}\n"
-
+        text = "⚙️ настройки LLM\n\nвыбери секцию для настройки:"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
 
     # --- УПРАВЛЕНИЕ ПРОКСИ ---

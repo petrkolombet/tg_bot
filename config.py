@@ -40,7 +40,7 @@ CHECK_INTERVAL_SECONDS = 60
 REFLECTION_INTERVAL_HOURS = 1
 SILENCE_BEFORE_REFLECTION_HOURS = 0.15
 SILENCE_BEFORE_PROACTIVE_MINUTES = 30
-MAX_BACKGROUND_THOUGHTS = 6  # ротация фоновых мыслей: оставляем только последние N
+MAX_BACKGROUND_THOUGHTS = 3  # ротация фоновых мыслей: оставляем только последние N (в промт идёт N мыслей)
 
 # --- Будильники и темы ---
 ALARM_MAX_MISSES = 2

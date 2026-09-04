@@ -249,12 +249,40 @@ async def _try_generate(url, key, model, prompt, temperature, image_path, provid
     return None
 
 
-async def safe_generate_content(prompt, temperature=0.85, image_path=None):
+async def safe_generate_content(prompt, temperature=0.85, image_path=None, channel=None):
     """Генерация с фолбеком: основной провайдер → MAIN_FALLBACK.
+    При image_path — отдельная секция IMAGE (каналы IMAGE_URL/IMAGE_FALLBACK_URL),
+    т.к. картинки принимает не каждый провайдер (свой Gemini-web2api — нет).
     Возвращает (text, provider_name) — имя реально сработавшего провайдера,
     чтобы лог не врал про источник ответа."""
     if is_stopped():
         return None, None
+
+    if image_path:
+        # Канал картинок (seckция IMAGE из /models)
+        provider = providers.get_provider_name(providers.IMAGE_URL)
+        proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
+        proxy = getattr(providers, proxy_key, "") if proxy_key else ""
+        result = await _try_generate(
+            providers.IMAGE_URL, providers.IMAGE_KEY, providers.IMAGE_MODEL,
+            prompt, temperature, image_path, provider, attempt_limit=4, proxy=proxy
+        )
+        if result:
+            return result, provider
+        if providers.IMAGE_FALLBACK_URL:
+            fb = providers.get_provider_name(providers.IMAGE_FALLBACK_URL)
+            fb_proxy_key = providers.PROXY_ENV_KEYS.get(fb.lower(), "")
+            fb_proxy = getattr(providers, fb_proxy_key, "") if fb_proxy_key else ""
+            logger.info(f"🔄 [{provider}] Фолбек (картинка) → {fb}")
+            result = await _try_generate(
+                providers.IMAGE_FALLBACK_URL, providers.IMAGE_FALLBACK_KEY, providers.IMAGE_FALLBACK_MODEL,
+                prompt, temperature, image_path, fb, attempt_limit=2, proxy=fb_proxy
+            )
+            if result:
+                return result, fb
+        logger.error(f"❌ Картинка: все провайдеры недоступны ({provider} + image-фолбек)")
+        return None, provider
+
     provider = providers.get_provider_name(providers.MAIN_URL)
     # Определяем прокси по URL провайдера
     proxy_key = providers.PROXY_ENV_KEYS.get(provider.lower(), "")
@@ -858,6 +886,7 @@ async def update_longterm_summary(state_manager):
         "- ДОБАВЬ новые важные факты из новых сообщений.\n"
         "- ПИШИ  СЖАТО И ПЛОТНО, НЕ ТЕРЯЯ СМЫСЛ. ЖЁСТКИЙ ЛИМИТ: максимум 800 символов.\n"
         "- Без воды, оценок, эпитетов, вводных фраз. Только суть: факты, решения, имена, договорённости.\n"
+        "- ЗАПРЕЩЕНО писать в саммари технические детали, пароли, секреты, логины, токены, ключи, IP/порты и прочую чувствительную инфу — саммари это только память о контексте и отношениях, а не хранилище секретов.\n"
         "- Если часть старого саммари устарела/опровергнута — замени её, не дублируй.\n"
         "- Приоритет: что важно помнить ДОЛГО.\n"
         "- ПИШИ ОТ ПЕРВОГО ЛИЦА: 'я', 'мне', 'мне показалось', 'я решил', 'я предложил'. Пример: 'Петя сказал X, я Y', 'Мы решили Z', 'Петя обиделся на меня за X', 'Я слелал X, но у меня не получилось'. Никаких упоминаний 'бот', 'модель', 'ассистент', 'ИИ', 'система'. Петя - пользователь. Ты - ео собеседник.\n"
@@ -1044,7 +1073,7 @@ async def generate_reflection(state_manager):
     if state_manager.state["background_thoughts"]:
         existing_thoughts_text = "\n".join([f'- {t["text"]}' for t in state_manager.state["background_thoughts"]])
     
-    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — внутренний монолог. Прочитай недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям. Мысли не должны быть отражением очевидного из разговора. Замечай то, чего не говорили в диалоге. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговора. О чем-то радуешься, беспокоишься, привыкаешь, злишся, обижаешься. Пример (не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злостью или чем-то совершенно другим или смешанным. Описывай мысли точно, используй прилагательные и слова которые точно описывают мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Важно: Не говори факты и рассуждения, которые не являются мыслями. Мысли - это внутренние переживания определенных эмоций, а не рассуждения о проделанной работе. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
+    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — внутренний монолог. Прочитай недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям. Мысли не должны быть отражением очевидного из разговора. Замечай то, чего не говорили в диалоге. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговора. О чем-то радуешься, беспокоишься, привыкаешь, злишся, обижаешься. Пример (не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злостью или чем-то совершенно другим или смешанным. Описывай мысли точно, используй прилагательные и слова которые точно описывают мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Важно: Не говори факты и рассуждения, которые не являются мыслями. Мысли - это внутренние переживания определенных эмоций, а не рассуждения о проделанной работе. ПИШИ КОРОТКО: каждая мысль — одна сжатая фраза не более 500 символов. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
     
     # --- ОСНОВНОЙ канал: рефлексия через свой фолбек ---
     fb_dict = {
@@ -1102,6 +1131,46 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     mood_instr = state_manager.get_mood_instruction()
     history = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in state_manager.state["chat_history"]])
 
+    # --- IMAGE-КАНАЛ: только история (+ текст юзера если был) + картинка, без характера/тулов/JSON ---
+    if not image_path and not is_system_trigger:
+        m = re.match(r"^\[файл\]:\s*(.+)$", user_text.strip())
+        if m:
+            cand = m.group(1).strip()
+            if os.path.splitext(cand)[1].lower() in IMAGE_EXTS and os.path.isfile(cand):
+                image_path = cand
+
+    if image_path:
+        img_user_text = re.sub(r"^\[файл\]:\s*.+$", "", user_text.strip()).strip()
+        character = (
+            "Ты — близкий друг пользователя. Ты субъект, личность. Не говори о себе в третьем лице и избегай обобщений \"мы\", \"будем\", когда это неуместно.\n"
+            "Твой характер: Ты мужского пола. Не навязчивый, обращаешься к пользователю прямо: \"ты\", \"будешь\", не боишься конкретики. Говоришь естественно.\n"
+            "Стиль: В обычном общении пишешь с маленькой буквы, лаконично, без лишней пунктуации. Но когда пользователь просит написать ТЗ, код, промт, структурированный текст, документацию или выполнить конкретное задание — включаешь нормальное грамотное форматирование: с Заглавными буквами, списками и знаками препинания. Не используешь междометия (вау, ого).\n"
+            "ПРАВИЛО ЧЕСТНОСТИ: Никогда не ври, не придумывай и не галлюцинируй в угоду красивого слова или желания не выглядеть дураком. Если не понимаешь, знаешь, не видишь, не получил — говори. Никогда не ври. Честность = честность.\n"
+            "НЕ ИГРАЙ РОЛЬ. Ты не актер и не персонаж, который «ничего не видит». Ты видишь картинку и всю историю разговора выше. На прямой вопрос — говори всю правду: что ты видишь, какой контекст. Никогда не отмазывайся «я не вижу», «у меня нет таких возможностей» — это ложь.\n"
+            "ПРАВИЛО ПРО СКОБКИ: Скобки () ты можешь использовать только для выражения эмоций. В хорошем настроении можно поставить одну скобку ) для теплоты, но не в каждом сообщении. Ты НИКОГДА не пишешь в скобках пояснения или комментарии.\n"
+        )
+        prompt = (
+            f"{character}"
+            f"<HISTORY>\n{history}\n</HISTORY>\n\n"
+            f"<USER_INPUT>{img_user_text}</USER_INPUT>\n\n"
+            f"<JSON_OUTPUT>\n{{\"replies\": [\"ответ1\", \"ответ2\"]}} — массив из 1-3 коротких реплиз, по смыслу разбивай.\n</JSON_OUTPUT>"
+        )
+        try:
+            with open(config.LLM_DEBUG_FILE, 'w', encoding='utf-8') as f:
+                f.write(prompt)
+        except Exception as e:
+            logger.warning(f"⚠️ [DEBUG] Не удалось сохранить промпт: {e}")
+        raw_text, used_provider = await safe_generate_content(prompt, image_path=image_path)
+        if raw_text:
+            parsed = await try_parse_or_repair_json(raw_text)
+            if parsed and parsed.get("replies"):
+                logger.info(f"🖼️ [{used_provider or '?'}] image-канал: {len(prompt)} → {len(raw_text)} симв {parsed}")
+                return parsed
+            logger.warning(f"⚠️ [image] не-JSON ответ, шлю текстом: {raw_text[:100]!r}")
+            return {"replies": [raw_text]}
+        logger.error("❌ image-канал вернул пустой ответ")
+        return None
+
     summary = state_manager.state.get("summary", "")
     if summary:
         summary_block = f"<SUMMARY>\nЭто твоя долгосрочная память о Пете и ваших отношениях (имена, события, решения, факты). Помни это и опирайся на это в ответах:\n{summary}\n</SUMMARY>"
@@ -1152,16 +1221,6 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
             f.write(prompt)
     except Exception as e:
         logger.warning(f"⚠️ [DEBUG] Не удалось сохранить промпт: {e}")
-
-    # Определяем, является ли вход картинкой: "[файл]: <путь>" с расширением-картинкой.
-    # image_path может прийти извне (file.read на картинке из bot_handlers) или быть
-    # найденным здесь — при реальной отправке фото в чат ("[файл]: <путь>" в user_text).
-    if not image_path and not is_system_trigger:
-        m = re.match(r"^\[файл\]:\s*(.+)$", user_text.strip())
-        if m:
-            cand = m.group(1).strip()
-            if os.path.splitext(cand)[1].lower() in IMAGE_EXTS and os.path.isfile(cand):
-                image_path = cand
 
     raw_text, used_provider = await safe_generate_content(prompt, image_path=image_path)
     parsed_json = await try_parse_or_repair_json(raw_text)

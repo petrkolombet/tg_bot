@@ -211,6 +211,14 @@ TRANSCRIBE_FALLBACK_URL = _env("TRANSCRIBE_FALLBACK_URL")
 TRANSCRIBE_FALLBACK_KEY = _env("TRANSCRIBE_FALLBACK_KEY")
 TRANSCRIBE_FALLBACK_MODEL = _env("TRANSCRIBE_FALLBACK_MODEL")
 
+# --- Фото/картинки (визуальный ввод: image_url в content) ---
+IMAGE_URL = _env("IMAGE_URL", "https://g4f.space/api/gemini")
+IMAGE_KEY = _env("IMAGE_KEY", "")
+IMAGE_MODEL = _env("IMAGE_MODEL", "models/gemini-3.5-flash")
+IMAGE_FALLBACK_URL = _env("IMAGE_FALLBACK_URL")
+IMAGE_FALLBACK_KEY = _env("IMAGE_FALLBACK_KEY")
+IMAGE_FALLBACK_MODEL = _env("IMAGE_FALLBACK_MODEL")
+
 # --- Perplexity (мёртвый фолбек-поиск) ---
 PERPLEXITY_COOKIE = _env("PERPLEXITY_COOKIE")
 PERPLEXITY_RW_TOKEN = _env("PERPLEXITY_RW_TOKEN")
@@ -349,6 +357,7 @@ SECTION_KEYS = {
     "rag": ("RAG_URL", "RAG_KEY", "RAG_MODEL"),
     "embed": ("EMBED_URL", "EMBED_KEY", "EMBED_MODEL"),
     "transcribe": ("TRANSCRIBE_URL", "TRANSCRIBE_KEY", "TRANSCRIBE_MODEL"),
+    "image": ("IMAGE_URL", "IMAGE_KEY", "IMAGE_MODEL"),
 }
 
 # Фолбеки: секция -> (url_key, key_key, model_key)
@@ -360,6 +369,7 @@ FALLBACK_KEYS = {
     "rag": ("RAG_FALLBACK_URL", "RAG_FALLBACK_KEY", "RAG_FALLBACK_MODEL"),
     "embed": ("EMBED_FALLBACK_URL", "EMBED_FALLBACK_KEY", "EMBED_FALLBACK_MODEL"),
     "transcribe": ("TRANSCRIBE_FALLBACK_URL", "TRANSCRIBE_FALLBACK_KEY", "TRANSCRIBE_FALLBACK_MODEL"),
+    "image": ("IMAGE_FALLBACK_URL", "IMAGE_FALLBACK_KEY", "IMAGE_FALLBACK_MODEL"),
 }
 
 
