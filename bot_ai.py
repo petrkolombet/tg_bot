@@ -32,10 +32,36 @@ def is_stopped():
     return False
 
 def clean_json_response(text):
-    match = re.search(r'\{.*\}', text, re.DOTALL)
+    # Вытаскиваем самый первый сбалансированный JSON-объект (от { до парной }),
+    # чтобы не захватывать хвост/дубль (модели иногда оборачивают JSON в ```json ... ```).
+    match = re.search(r'\{', text)
     if not match:
         return text.strip()
-    result = match.group(0).strip()
+    start = match.start()
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                result = text[start:i+1].strip()
+                break
+    else:
+        return text.strip()
     # Чиним частые косяки моделей: лишняя ) или ] после строки в JSON
     result = re.sub(r'"\s*\)\s*,\s*"', '", "', result)
     result = re.sub(r'"\s*\)\s*\]', '"]', result)
@@ -796,6 +822,40 @@ async def _transcribe_url(audio_bytes, filename, url, key, model, attempts=2):
                 await asyncio.sleep(2)
     return None
 
+def _escape_raw_newlines_in_json_strings(text):
+    """Экранирует живые переносы строк внутри JSON-строк.
+
+    Модели часто вставляют код в строку replies с реальными переводами строки
+    (не экранированным \\n) — такой ответ валиден как текст, но не как JSON.
+    Проходим по строке от первого '{', отслеживая состояние "внутри JSON-строки",
+    и заменяем реальные \r\n внутри строк на экранированную \\n.
+    """
+    start = text.find('{')
+    if start == -1:
+        return text
+    out = list(text[:start])
+    in_str = False
+    esc = False
+    for ch in text[start:]:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            elif ch in '\r\n':
+                out.append('\\n')
+                continue
+        else:
+            if ch == '"':
+                in_str = True
+        out.append(ch)
+    if in_str:
+        out.append('"')
+    return ''.join(out)
+
+
 async def try_parse_or_repair_json(raw_text):
     if not raw_text:
         return None
@@ -812,11 +872,15 @@ async def try_parse_or_repair_json(raw_text):
     try:
         return json.loads(clean_json_response(raw_text))
     except (json.JSONDecodeError, AttributeError, ValueError):
-        logger.warning(f"⚠️ [JSON] Ошибка парсинга. Отправляю как текст.")
-        # Если модель вернула просто текст без JSON — оборачиваем и отправляем
-        text = raw_text.strip()
-        if text:
-            return {"replies": [text], "mood_shift": 0.0}
+        # Модель могла вложить код в строку с реальными переносами — чиним их
+        try:
+            return json.loads(_escape_raw_newlines_in_json_strings(raw_text))
+        except (json.JSONDecodeError, AttributeError, ValueError):
+            logger.warning(f"⚠️ [JSON] Ошибка парсинга. Отправляю как текст.")
+            # Если модель вернула просто текст без JSON — оборачиваем и отправляем
+            text = raw_text.strip()
+            if text:
+                return {"replies": [text], "mood_shift": 0.0}
     return None
 
 async def retrieve_memory(user_query, query_topic, state_manager):
