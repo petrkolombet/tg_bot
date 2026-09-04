@@ -53,6 +53,16 @@ def embeddings_url(base_url):
     return url + "/v1/embeddings"
 
 
+def transcriptions_url(base_url):
+    """Нормализует базовый URL в полный путь /v1/audio/transcriptions (OpenAI-совместимый)."""
+    if not base_url:
+        return base_url
+    url = base_url.rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url + "/v1/audio/transcriptions"
+
+
 def parse_proxy(proxy_str):
     """Парсит прокси host:port:user:pass → http://user:pass@host:port или None."""
     if not proxy_str or not proxy_str.strip():
@@ -88,6 +98,8 @@ def get_provider_name(url):
         return "OPENROUTER"
     if "g4f.space" in url_lower:
         return "G4F"
+    if "groq" in url_lower:
+        return "GROQ"
     if "127.0.0.1:4984" in url or "localhost:4984" in url:
         return "GEMINI"
     if "127.0.0.1:9655" in url or "localhost:9655" in url:
@@ -140,6 +152,7 @@ PROXY_GEMINI = _env("PROXY_GEMINI")
 PROXY_ALICE = _env("PROXY_ALICE")
 PROXY_DEEPSEEK = _env("PROXY_DEEPSEEK")
 PROXY_GPT = _env("PROXY_GPT")
+PROXY_TRANSCRIBE = _env("PROXY_TRANSCRIBE")
 
 # --- Фолбек основной генерации ---
 MAIN_FALLBACK_URL = _env("MAIN_FALLBACK_URL")
@@ -190,6 +203,14 @@ EMBED_FALLBACK_URL = _env("EMBED_FALLBACK_URL")
 EMBED_FALLBACK_KEY = _env("EMBED_FALLBACK_KEY")
 EMBED_FALLBACK_MODEL = _env("EMBED_FALLBACK_MODEL")
 
+# --- Транскрибация голосовых (Groq/Whisper) ---
+TRANSCRIBE_URL = _env("TRANSCRIBE_URL", "https://api.groq.com/openai/v1")
+TRANSCRIBE_KEY = _env("TRANSCRIBE_KEY")
+TRANSCRIBE_MODEL = _env("TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
+TRANSCRIBE_FALLBACK_URL = _env("TRANSCRIBE_FALLBACK_URL")
+TRANSCRIBE_FALLBACK_KEY = _env("TRANSCRIBE_FALLBACK_KEY")
+TRANSCRIBE_FALLBACK_MODEL = _env("TRANSCRIBE_FALLBACK_MODEL")
+
 # --- Perplexity (мёртвый фолбек-поиск) ---
 PERPLEXITY_COOKIE = _env("PERPLEXITY_COOKIE")
 PERPLEXITY_RW_TOKEN = _env("PERPLEXITY_RW_TOKEN")
@@ -205,6 +226,7 @@ PROXY_ENV_KEYS = {
     "alice": "PROXY_ALICE",
     "deepseek": "PROXY_DEEPSEEK",
     "gpt": "PROXY_GPT",
+    "groq": "PROXY_TRANSCRIBE",
 }
 
 # Готовые провайдеры: имя -> (url, key, proxy).
@@ -217,6 +239,7 @@ PROVIDERS = {
     "gemini": ("http://127.0.0.1:4984/v1", GEMINI_KEY, PROXY_GEMINI),
     "g4f": ("https://g4f.space/api/gemini", G4F_KEY, PROXY_G4F),
     "openrouter": ("https://openrouter.ai/api/v1", OPENROUTER_KEY, PROXY_OPENROUTER),
+    "groq": ("https://api.groq.com/openai/v1", TRANSCRIBE_KEY, PROXY_TRANSCRIBE),
 }
 
 # Модели по провайдерам
@@ -277,6 +300,14 @@ PROVIDER_MODELS = {
     "gpt": [
         ("chatgpt", "ChatGPT"),
     ],
+    "groq": [
+        ("whisper-large-v3-turbo", "Whisper Large V3 Turbo"),
+        ("whisper-large-v3", "Whisper Large V3"),
+        ("whisper-medium", "Whisper Medium"),
+        ("whisper-small", "Whisper Small"),
+        ("whisper-base", "Whisper Base"),
+        ("whisper-tiny", "Whisper Tiny"),
+    ],
 }
 
 # Динамическая загрузка free-моделей OpenRouter
@@ -317,6 +348,7 @@ SECTION_KEYS = {
     "reflection": ("REFLECTION_PROXY_URL", "REFLECTION_PROXY_KEY", "REFLECTION_MODEL"),
     "rag": ("RAG_URL", "RAG_KEY", "RAG_MODEL"),
     "embed": ("EMBED_URL", "EMBED_KEY", "EMBED_MODEL"),
+    "transcribe": ("TRANSCRIBE_URL", "TRANSCRIBE_KEY", "TRANSCRIBE_MODEL"),
 }
 
 # Фолбеки: секция -> (url_key, key_key, model_key)
@@ -327,6 +359,7 @@ FALLBACK_KEYS = {
     "reflection": ("REFLECTION_FALLBACK_URL", "REFLECTION_FALLBACK_KEY", "REFLECTION_FALLBACK_MODEL"),
     "rag": ("RAG_FALLBACK_URL", "RAG_FALLBACK_KEY", "RAG_FALLBACK_MODEL"),
     "embed": ("EMBED_FALLBACK_URL", "EMBED_FALLBACK_KEY", "EMBED_FALLBACK_MODEL"),
+    "transcribe": ("TRANSCRIBE_FALLBACK_URL", "TRANSCRIBE_FALLBACK_KEY", "TRANSCRIBE_FALLBACK_MODEL"),
 }
 
 

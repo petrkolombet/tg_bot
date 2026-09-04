@@ -701,35 +701,72 @@ _transcribe_key_idx = 0
 
 async def transcribe_voice(audio_bytes, filename):
     global _transcribe_key_idx
-    if not config.GROQ_KEYS:
-        logger.error("❌ [TRANSCRIBE] Нет Groq ключей")
+
+    # Ключ: TRANSCRIBE_KEY из .env, иначе ротация legacy GROQ_KEYS
+    if providers.TRANSCRIBE_KEY:
+        key = providers.TRANSCRIBE_KEY
+    elif not config.GROQ_KEYS:
+        logger.error("❌ [TRANSCRIBE] Нет ключей (TRANSCRIBE_KEY / GROQ_KEYS)")
         return None
-    
-    key = config.GROQ_KEYS[_transcribe_key_idx % len(config.GROQ_KEYS)]
-    _transcribe_key_idx += 1
-    
+    else:
+        key = config.GROQ_KEYS[_transcribe_key_idx % len(config.GROQ_KEYS)]
+        _transcribe_key_idx += 1
+
+    text = await _transcribe_url(audio_bytes, filename,
+                                  providers.TRANSCRIBE_URL, key, providers.TRANSCRIBE_MODEL)
+    if text:
+        return text
+
+    if providers.TRANSCRIBE_FALLBACK_URL:
+        fb_key = providers.TRANSCRIBE_FALLBACK_KEY or key
+        fb_model = providers.TRANSCRIBE_FALLBACK_MODEL or providers.TRANSCRIBE_MODEL
+        logger.info("🔄 [TRANSCRIBE] Фолбек → %s", providers.get_provider_name(providers.TRANSCRIBE_FALLBACK_URL))
+        text = await _transcribe_url(audio_bytes, filename,
+                                      providers.TRANSCRIBE_FALLBACK_URL, fb_key, fb_model)
+        if text:
+            return text
+
+    logger.error("❌ [TRANSCRIBE] Все провайдеры недоступны")
+    return None
+
+async def _transcribe_url(audio_bytes, filename, url, key, model, attempts=2):
+    """Один запрос транскрибации (multipart). Прокси — по URL провайдера. Возвращает текст или None."""
+    if not url or not key:
+        logger.warning(f"⚠️ [TRANSCRIBE] Нет URL/ключа")
+        return None
+    proxy = providers.proxy_for_url(url)
     import io
     import requests as req
-    try:
-        loop = asyncio.get_running_loop()
-        def do_request():
-            return req.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {key}"},
-                data={"model": "whisper-large-v3-turbo", "language": "ru"},
-                files={"file": (filename, io.BytesIO(audio_bytes), "audio/ogg")},
-                timeout=30,
-                proxies={"https": "http://15Uo6V:3HF2Fh@170.83.236.245:8000", "http": "http://15Uo6V:3HF2Fh@170.83.236.245:8000"},
-            )
-        resp = await loop.run_in_executor(None, do_request)
-        logger.info(f"🎤 [TRANSCRIBE] Groq ответ: {resp.status_code} -> {resp.text[:300]}")
-        data = resp.json()
-        text = data.get('text', '')
-        logger.info(f"🎤 [TRANSCRIBE] Распознано: {text[:100]}")
-        return text
-    except Exception as e:
-        logger.error(f"❌ [TRANSCRIBE] Ошибка: {e}")
-        return None
+    loop = asyncio.get_running_loop()
+    for attempt in range(attempts):
+        if is_stopped():
+            return None
+        try:
+            proxies = {"https": proxy, "http": proxy} if proxy else None
+            def do_request():
+                return req.post(
+                    providers.transcriptions_url(url),
+                    headers={"Authorization": f"Bearer {key}"},
+                    data={"model": model, "language": "ru"},
+                    files={"file": (filename, io.BytesIO(audio_bytes), "audio/ogg")},
+                    timeout=30,
+                    proxies=proxies,
+                )
+            resp = await loop.run_in_executor(None, do_request)
+            logger.info(f"🎤 [TRANSCRIBE] ответ {resp.status_code}: {resp.text[:300]}")
+            if resp.status_code != 200:
+                raise Exception(f"HTTP {resp.status_code}")
+            data = resp.json()
+            text = data.get('text', '')
+            if not text:
+                raise Exception("пустой ответ")
+            logger.info(f"🎤 [TRANSCRIBE] Распознано: {text[:100]}")
+            return text
+        except Exception as e:
+            logger.error(f"❌ [TRANSCRIBE] Ошибка (попытка {attempt+1}): {e}")
+            if attempt < attempts - 1:
+                await asyncio.sleep(2)
+    return None
 
 async def try_parse_or_repair_json(raw_text):
     if not raw_text:

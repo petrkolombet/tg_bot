@@ -1219,6 +1219,14 @@ LLM_SECTIONS = {
         ("EMBED_FALLBACK_KEY", "Фолбек Ключ"),
         ("EMBED_FALLBACK_MODEL", "Фолбек Модель"),
     ]),
+    "transcribe": ("🎙️ Транскрибация (голосовые)", [
+        ("TRANSCRIBE_URL", "URL"),
+        ("TRANSCRIBE_KEY", "Ключ"),
+        ("TRANSCRIBE_MODEL", "Модель"),
+        ("TRANSCRIBE_FALLBACK_URL", "Фолбек URL"),
+        ("TRANSCRIBE_FALLBACK_KEY", "Фолбек Ключ"),
+        ("TRANSCRIBE_FALLBACK_MODEL", "Фолбек Модель"),
+    ]),
 }
 
 # Провайдеры, модели, секции и фолбеки — ЕДИНСТВЕННЫЙ источник: providers.py
@@ -1664,6 +1672,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "openrouter": ["tg-bot"],
             "g4f": ["tg-bot"],
             "alice": ["tg-bot"],
+            "groq": ["tg-bot"],
         }
 
         def _restart_services(prov):
