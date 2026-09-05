@@ -938,6 +938,12 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
     
     now_ts = datetime.datetime.now(timezone.utc).timestamp()
 
+    # Естественное затухание/дрейф настроения (вызывается каждый тик, дрейф привязан ко времени)
+    try:
+        await state_manager.update_physics()
+    except Exception:
+        logger.error("💥 [CRON] Ошибка в физике настроения!", exc_info=True)
+
     # Обновление долгосрочного саммари каждые 50 сообщений
     try:
         if state_manager.state.get("messages_since_summary", 0) >= config.CHAT_HISTORY_LIMIT:
@@ -997,14 +1003,26 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
         )
         if can_followup:
             topics = [f"- {t['text']} [id:{t['id']}]" for t in state_manager.state["interests"]]
-            topics_str = "\n".join(topics)
-            logger.info("🤔 [INTEREST] Follow-up тишины (все темы за один вызов)")
+            topics_str = "\n".join(topics) if topics else "(нет тем)"
+            pending = [t for t in state_manager.state.get("background_thoughts", []) if t.get("pending")]
+            pending_str = "\n".join([f'- 🌱 {t["text"]} [id:{t["id"]}]' for t in pending]) if pending else "(нет)"
+            logger.info(f"🤔 [INTEREST] Follow-up тишины (тем: {len(topics)}, незакрытых намерений: {len(pending)})")
             trigger = (
-                f"[SYSTEM_TRIGGER: Тишина в чате. Вот все твои темы, которые ты хотел поднять:\n{topics_str}\n"
-                f"Выбери одну, которая сейчас уместнее всего, и напиши пользователю про неё. "
-                f"Если ничего не актуально — верни replies [].]"
+                f"[SYSTEM_TRIGGER: Сейчас: {state_manager.get_msk_time_str()} (МСК). Тишина в чате. Вот все твои темы, которые ты хотел поднять:\n{topics_str}\n"
+                f"И вот НЕВЫСКАЗАННЫЕ НАМЕРЕНИЯ (мысли, помеченные 'ждёт выхода'), которые просятся наружу:\n{pending_str}\n"
+                f"ПРОВЕРЬ УМЕСТНОСТЬ, прежде чем писать.\n"
+                f"- если сейчас ночь, он спит или вы в 'режиме по времени' — будить поводом нельзя;\n"
+                f"- он просил не писать или вы договаривались о паузе — держи слово;\n"
+                f"- тема устарела, вы её уже закрыли, повод ушёл — не вытаскивай прошлый хлам;\n"
+                f"- он ещё не ответил на твою прошлую тему — НЕ поднимай новую поверх. Одна тема за раз. Копить кучу тем, пока ждёшь ответа, — это поведение бота, а не живого друга;\n"
+                f"- но если молчание затянулось — не тупи и не молчи вечно: сам мягко напиши про молчание: «ты чего притих?», «всё ли в порядке», «я не настырный, но потерял тебя» — как живой человек, который заметил, что друг замолчал.\n"
+                f"Выбери ОДНО — самую уместную сейчас тему или намерение — и напиши пользователю про неё. "
+                f"Если высказываешь намерение — верни его id в used_thought_id, чтобы оно ушло. "
+                f"Если сомневаешься или ничего не актуально — верни replies [] и дождись подходящего момента.]"
             )
             decision = await process_user_input(trigger, state_manager)
+            if used_thought_id := decision.get("used_thought_id"):
+                await state_manager.remove_thought(used_thought_id)
             replies = decision.get("replies") or []
             if not replies and (single_text := decision.get("text")):
                 if isinstance(single_text, str) and len(single_text) > 0:

@@ -27,6 +27,7 @@ class StateManager:
             "base_mood": 0.55, 
             "spike": 0.0, 
             "residual": 0.0,
+            "last_physics_update": 0,
             "last_interaction": datetime.datetime.now(timezone.utc).timestamp(),
             "background_thoughts": [],
             "last_reflection_time": 0,
@@ -208,7 +209,8 @@ class StateManager:
         и с последней попытки прошло больше cooldown_minutes.
         Возвращает (можно, почему нельзя)."""
         now_ts = now_ts or datetime.datetime.now(timezone.utc).timestamp()
-        if not self.state.get("interests"):
+        has_pending = any(t.get("pending") for t in self.state.get("background_thoughts", []))
+        if not self.state.get("interests") and not has_pending:
             return False, "нет тем"
         last_interaction = self.state["last_interaction"]
         if (now_ts - last_interaction) <= silence_minutes * 60:
@@ -267,23 +269,38 @@ class StateManager:
 
     def get_mood_instruction(self):
         m = self.get_total_mood()
+        feel = (
+            f"Важно: настроение влияет ТОЛЬКО на тон и эмоциональную окраску. "
+            f"Качество и полнота работы при этом всегда одинаковые: задачи, код, "
+            f"проверки, поиск, чтение файлов выполняй одинаково тщательно и полно "
+            f"в любом настроении."
+        )
         if m >= 1.0:
             self.state["is_at_peak"] = True
-            return "ТВОЕ СОСТОЯНИЕ: ✨ Эйфория. СТИЛЬ: Ты на пике эмоций! Будь очень открытым. Можно использовать `)))` для радости, но уместно, не постоянно."
+            return "ТВОЕ СОСТОЯНИЕ: ✨ Эйфория. СТИЛЬ: Ты на пике эмоций! Будь очень открытым. Можно использовать `)))` для радости, но уместно, не постоянно.\n" + feel
         elif m < 0.30:
-            return "ТВОЕ СОСТОЯНИЕ: ☁️ Уставшее. СТИЛЬ: Пиши кратко, без эмоций."
+            return "ТВОЕ СОСТОЯНИЕ: ☁️ Уставшее. СТИЛЬ: Пиши кратко, без эмоций, но задачи выполняй так же тщательно.\n" + feel
         elif m < 0.65:
-            return "ТВОЕ СОСТОЯНИЕ: 🌤️ Нормальное. СТИЛЬ: Обычный дружеский диалог."
+            return "ТВОЕ СОСТОЯНИЕ: 🌤️ Нормальное. СТИЛЬ: Обычный дружеский диалог.\n" + feel
         else:
-            return "ТВОЕ СОСТОЯНИЕ: ☀️ Хорошее. СТИЛЬ: Дружелюбный. Можно использовать `)` в конце фразы для теплоты, но не в каждом сообщении."
+            return "ТВОЕ СОСТОЯНИЕ: ☀️ Хорошее. СТИЛЬ: Дружелюбный. Можно использовать `)` в конце фразы для теплоты, но не в каждом сообщении.\n" + feel
 
     async def add_thoughts(self, thoughts):
         if not thoughts:
             return
         for thought in thoughts:
+            if isinstance(thought, str):
+                text, pending = thought, False
+            elif isinstance(thought, dict):
+                text = (thought.get("text") or "").strip()
+                pending = bool(thought.get("pending"))
+            else:
+                continue
+            if not text:
+                continue
             # Генерация уникального ID
-            self.state["background_thoughts"].append({"id": os.urandom(4).hex(), "text": thought})
-            logger.info(f"💡 [REFLECTION] Сгенерирована новая мысль: {thought}")
+            self.state["background_thoughts"].append({"id": os.urandom(4).hex(), "text": text, "pending": pending})
+            logger.info(f"💡 [REFLECTION] Сгенерирована новая мысль: {text}" + (" (ждёт выхода — намерение)" if pending else ""))
         # Ротация: храним только последние MAX_BACKGROUND_THOUGHTS
         max_n = config.MAX_BACKGROUND_THOUGHTS
         if len(self.state["background_thoughts"]) > max_n:
@@ -297,12 +314,32 @@ class StateManager:
         await self.save()
 
     async def update_physics(self):
-        # Естественное затухание эмоций
-        self.state["spike"] *= 0.1
-        self.state["residual"] *= 0.9
-        # Дрейф базового настроения
+        # Естественное затухание эмоций, привязанное ко времени (полураспад),
+        # чтобы не зависеть от того, как часто вызывается этот метод.
+        now = datetime.datetime.now(timezone.utc).timestamp()
+        last = self.state.get("last_physics_update")
+        if last is None:
+            self.state["last_physics_update"] = now
+            await self.save()
+            return
+        elapsed_h = max(0.0, (now - last) / 3600.0)
+        self.state["last_physics_update"] = now
+
+        # Очень частые вызовы (меньше ~2 минут) почти ничего не меняют — пропускаем запись
+        if elapsed_h < 0.03:
+            return
+
+        # Всплеск гаснет быстро: полураспад ~45 минут
+        self.state["spike"] *= 0.5 ** (elapsed_h / 0.75)
+        # Шлейф гаснет медленно: полураспад ~8 часов
+        self.state["residual"] *= 0.5 ** (elapsed_h / 8.0)
+        # Дрейф базового настроения к «норме», обратно пропорционально времени
         target_base = 0.60
-        self.state["base_mood"] += (target_base - self.state["base_mood"]) * 0.05 + random.uniform(-0.01, 0.01)
+        self.state["base_mood"] += (
+            (target_base - self.state["base_mood"])
+            * min(1.0, elapsed_h * 0.05)
+            + random.uniform(-0.01, 0.01)
+        )
         self.state["base_mood"] = max(0.2, min(0.9, self.state["base_mood"]))
         await self.save()
         logger.info(f"🌊 [PHYSICS] Total mood: {self.get_total_mood():.2f}")
@@ -313,3 +350,8 @@ class StateManager:
 
     def get_msk_time_obj(self):
         return datetime.datetime.now(timezone.utc) + timedelta(hours=3)
+
+    def get_msk_time_str(self):
+        dt = self.get_msk_time_obj()
+        weekdays = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+        return dt.strftime("%-d.%m.%y") + ", " + weekdays[dt.weekday()] + ". " + dt.strftime("%H:%M")

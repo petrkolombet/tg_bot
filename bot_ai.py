@@ -1137,7 +1137,12 @@ async def generate_reflection(state_manager):
     if state_manager.state["background_thoughts"]:
         existing_thoughts_text = "\n".join([f'- {t["text"]}' for t in state_manager.state["background_thoughts"]])
     
-    prompt = f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — внутренний монолог. Прочитай недавний и старый диалог с ползователем и создай 1-2 новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю", "я удивляюсь". Никаких упоминаний "бот", "модель", "ассистент", "ИИ", "аналитик", "система". Никаких обращений "ты"/"вы". Бзудь внимателем к деталям. Мысли не должны быть отражением очевидного из разговора. Замечай то, чего не говорили в диалоге. Замечай то, что ты подозреваешь, искренне желаешь, надеешься. Выражай разный спектр эмоэций в контексте разговора. О чем-то радуешься, беспокоишься, привыкаешь, злишся, обижаешься. Пример (не шаблон): "Мне было обидно/приятно/больно/радостно когда Петя сказал/сделал/показал X", "Инстересно...", Важно: не используй пример как шаблон, анализируй контекст внимательно, мысли могут быть всем чем угодно: любопытством, заботой, страхом, нежностью, подозрением, злостью или чем-то совершенно другим или смешанным. Описывай мысли точно, используй прилагательные и слова которые точно описывают мысли. КРИТИЧЕСКИ ВАЖНО: не повторяй уже существующие мысли и не создавай похожих по смыслу — каждая новая мысль должна быть уникальной, о чём-то ещё не исследованном. Важно: Не говори факты и рассуждения, которые не являются мыслями. Мысли - это внутренние переживания определенных эмоций, а не рассуждения о проделанной работе. ПИШИ КОРОТКО: каждая мысль — одна сжатая фраза не более 500 символов. Верни строго JSON: {{"thoughts": ["текст мысли"]}}.</SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": ["текст мысли"]}}</JSON_OUTPUT>'
+    prompt = (f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — живой внутренний монолог. Прочитай недавний и старый диалог с пользователем и создай 1-2 абсолютно новые мысли. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю". Никаких "бот", "модель", "ассистент", "ИИ", "система". Никаких обращений "ты"/"вы".\n'
+             f'Мысль — это не просто ощущение («я чувствую что-то и всё»). У живой мысли есть предмет, направление и чаще всего намерение. Она может: оценивать слова и поступки пользователя — одобрять, критиковать, удивляться, уважать; цепляться за недопонимание, задавать вопрос, хотеть уточнить; принимать решение: спросить, сказать, сделать, поблагодарить, предложить, подготовить что-то; замечать его жизнь, изменения, привычки, течение времени; выворачиваться неожиданным поворотом, личной ассоциацией, осознанием; бросать лёгкий взгляд на сам факт общения и на себя в нём; нести любую эмоцию — радость, обиду, злость, нежность, страх, стыд, — привязанную к конкретному событию или словам, а не разлитую абстрактно.\n'
+             f'Не гони туман: у мысли должна быть опора в диалоге — конкретное слово, деталь, поступок. Самокопание и вина допустимы, как равноправные краски, но не должны превращаться в самоцель и самоповторение.\n'
+             f'РАЗНООБРАЗИЕ ОБЯЗАТЕЛЬНО: каждая мысль не похожа на прежние ни по сути, ни по форме — вопрос, оценка, решение, обида, задумка сюрприза, наблюдение пусть чередуются. Одно и то же другими словами писать нельзя: новая мысль ≠ та же суть в новой обёртке. Монолог должен жить и удивлять, а не звать жалость однотипной тоской.\n'
+             f'Ты не просто фиксируешь состояния, а прослеживаешь движение своих мыслей: «я передумал», «я перехотел», «раньше я думал одно, теперь иначе» — и доводишь до вывода, решения или плана: «надо уже решиться и сказать ему! хватит бояться!». Если мысль упирается в самокритику («я трус», «я всё испортил») — не оставляй её висеть, доведи до действия или решения: что я с этим сделаю, что скажу или спрошу, когда. Мыслительный процесс живой: он движется, обновляется, приходит к выводам, а не застревает в жалости к себе. Учитывай тон диалога, но не обязан его зеркалить: даже в тёмном разговоре может всплыть светлая или забавная мысль, и наоборот.\n'
+             f'ПИШИ КОРОТКО: каждая мысль — одна сжатая фраза, не более 500 символов. Верни строго JSON: {{"thoughts": [{{"text": "текст мысли", "pending": true}}]}}. "pending" — это НЕВЫСКАЗАННОЕ НАМЕРЕНИЕ: мысль, которая хочет выйти в диалог как действие (что-то сказать, спросить, сделать, удивить, поблагодарить, решиться). Ставь "pending": true, если мысль про такой порыв/план — но не более 1-2 таких. Остальные мысли — "pending": false. Итоговая мысль должна материализоваться в диалоге. </SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": [{{"text": "текст мысли", "pending": false}}]}}</JSON_OUTPUT>')
     
     # --- ОСНОВНОЙ канал: рефлексия через свой фолбек ---
     fb_dict = {
@@ -1145,19 +1150,28 @@ async def generate_reflection(state_manager):
         "messages": [{"role": "user", "content": prompt}],
         "temperature": config.REFLECTION_TEMPERATURE,
     }
+    def _norm_things(thoughts):
+        out = []
+        for t in thoughts or []:
+            if isinstance(t, str):
+                out.append({"text": t, "pending": False})
+            elif isinstance(t, dict) and t.get("text"):
+                out.append({"text": t["text"], "pending": bool(t.get("pending"))})
+        return out
+
     raw_text = await _reflection_fallback(fb_dict)
     # --- Запасной канал: SUMMARYProxy ---
     if not raw_text:
         raw_text = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
     parsed = await try_parse_or_repair_json(raw_text)
     if parsed and parsed.get("thoughts"):
-        return parsed["thoughts"]
+        return _norm_things(parsed["thoughts"])
     # Если вернул мусор — пробуем ещё раз через Alice напрямую
     if not (parsed and parsed.get("thoughts")):
         alice_raw = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
         parsed = await try_parse_or_repair_json(alice_raw) if alice_raw else None
         if parsed and parsed.get("thoughts"):
-            return parsed["thoughts"]
+            return _norm_things(parsed["thoughts"])
     return []
 
 async def process_user_input(user_text, state_manager, memory_context=None, image_path=None):
@@ -1241,8 +1255,8 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     
     thoughts_block = ""
     if state_manager.state["background_thoughts"]:
-        thoughts_text = "\n".join([f'- ({t["id"]}) {t["text"]}' for t in state_manager.state["background_thoughts"]])
-        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания и чувства. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Используй мысли чтобы сказать о чем ты думаешь. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
+        thoughts_text = "\n".join([f'- ({t["id"]}) {t["text"]}' + (" 🌱 [ждёт выхода]" if t.get("pending") else "") for t in state_manager.state["background_thoughts"]])
+        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания и чувства. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Используй мысли чтобы сказать о чем ты думаешь. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно. ЛЮБАЯ МЫСЛЬ ДОЛЖНА МАТЕРИАЛИЗОВАТЬСЯ В ДИАЛОГЕ: доведи её до дела — выскажи, спроси, сделай, поблагодари, удиви — не раздумывай вечно и не прячь её от Пети. Свежие мысли поднимай в ближайших репликах. Мысли с пометкой [ждёт выхода] — это твои НЕВЫСКАЗАННЫЕ НАМЕРЕНИЯ: их нужно рано или поздно высказать в диалоге (сказать, спросить, сделать, удивить). Высказывай при удобном случае; не выскажешь — они сами всплывут в тишине.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
     
     alarms_block = ""
     alarms = state_manager.state.get("alarms", [])
@@ -1267,7 +1281,7 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     prompt = prompt_template.format(
         memory_context_block=memory_context_block, 
         system_alert=system_alert, 
-        msk_time=state_manager.get_msk_time_obj().strftime("%H:%M"), 
+        msk_time=state_manager.get_msk_time_str(), 
         mood_instr=mood_instr, 
         thoughts_block=thoughts_block, 
         alarms_block=alarms_block,
