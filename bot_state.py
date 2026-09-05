@@ -76,13 +76,17 @@ class StateManager:
     async def save(self):
         async with self.lock:
             temp_file = self.filename + ".tmp"
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, ensure_ascii=False, indent=2)
-            os.replace(temp_file, self.filename)
+            try:
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.state, f, ensure_ascii=False, indent=2)
+                os.replace(temp_file, self.filename)
+            except OSError as e:
+                logger.error(f"❌ [STATE] Не удалось сохранить state.json: {e}")
+                self.state["sys_notice"] = "Системный сбой: не удалось сохранить память (вероятно, кончилось место на диске). Сообщения обрабатываются, но могут потеряться при перезапуске. Скажи Пете, что что-то сбоит с памятью, и попроси повторить просьбу позже."
 
     async def add_history(self, role, text):
         msk = datetime.timezone(datetime.timedelta(hours=3))
-        ts = datetime.datetime.now(msk).strftime("%H:%M")
+        ts = datetime.datetime.now(msk).strftime("%d.%m %H:%M")
         new_message = {"role": role, "content": text, "ts": ts}
         # Краткосрочная память для промпта
         self.state["chat_history"].append(new_message)
@@ -101,7 +105,7 @@ class StateManager:
         Идёт В chat_history (чтобы бот видел свои действия в истории),
         но НЕ в reflection_history (для рефлексии не нужно)."""
         msk = datetime.timezone(datetime.timedelta(hours=3))
-        ts = datetime.datetime.now(msk).strftime("%H:%M")
+        ts = datetime.datetime.now(msk).strftime("%d.%m %H:%M")
         new_message = {"role": "tool", "content": record_text, "ts": ts}
         self.state["chat_history"].append(new_message)
         self.state["chat_history"] = self.state["chat_history"][-config.CHAT_HISTORY_LIMIT:]
