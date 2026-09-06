@@ -112,6 +112,18 @@ class StateManager:
         self.state["messages_since_summary"] = self.state.get("messages_since_summary", 0) + 1
         await self.save()
 
+    async def add_thought_record(self, record_text):
+        """Запись материализованной мысли (роль 'thought').
+        Пишется в chat_history ПЕРЕД сообщением, которое из неё выросло,
+        чтобы на «что?» бот понимал, зачем написал анонс.
+        НЕ идёт в reflection_history (для рефлексии не нужно)."""
+        msk = datetime.timezone(datetime.timedelta(hours=3))
+        ts = datetime.datetime.now(msk).strftime("%d.%m %H:%M")
+        new_message = {"role": "thought", "content": f'🧠 думал: "{record_text}"', "ts": ts}
+        self.state["chat_history"].append(new_message)
+        self.state["chat_history"] = self.state["chat_history"][-config.CHAT_HISTORY_LIMIT:]
+        await self.save()
+
     async def set_summary(self, summary_text):
         self.state["summary"] = summary_text
         self.state["messages_since_summary"] = 0

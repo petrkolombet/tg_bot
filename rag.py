@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 import uuid
+import math
 import urllib.parse
 
 os.environ["no_proxy"] = "127.0.0.1,localhost"
@@ -78,6 +79,13 @@ _WINDOW_EXTRACTION_PROMPT = """Ты — аккуратный агент запи
 УЖАСНЫЕ ПРИМЕРЫ — так сохранять НЕЛЬЗЯ (реальные ошибки памятного правила):
 - «Пользователь использует модель эмбеддингов nvidia/llama-nemotron-embed-vl-1b-v2:free через OpenRouter для векторной памяти бота; задержка на текущий момент не наблюдается» — это техническая деталь реализации/процесса, не стойкий факт о пользователе. НЕ сохраняй такие.
 - «Пользователь экспериментирует с разными настройками бота и следит, чтобы тот не сломался» — общее ничего-не-значащее, без конкретного факта. НЕ сохраняй размытое.
+
+АТОМАРНОСТЬ ФАКТОВ (важно):
+Каждый факт — ОДИН атомарный факт, записанный одной простой фразой, БЕЗ прилипания контекста. Если факт упомянут с обстоятельствами (зачем домен, где живёт и чем занят, какой возраст и роль) — сохраняй только сам факт:
+- «Пользователь использует домен example.com для сайта X» → сохрани «У пользователя есть домен example.com.», а не «У пользователя есть домен example.com, который используется для сайта X, связанного с проектом Y…».
+- «Пользователь живёт в Берлине, где работает над проектом Z» → сохрани «Пользователь живёт в Берлине.» (отдельный устойчивый контекст — отдельным фактом, если он сам по себе важен).
+- «Пользователю 25 лет, он фронтендер с 3 годами опыта» → два отдельных факта: «Пользователю 25 лет.» и «Пользователь — фронтендер.»
+Атомарность важна: поиск найдёт факт по отдельным словам («домен», «example.com»), поэтому связка «домен + для чего» не нужна. Дополнительный устойчивый контекст можно сохранить ОТДЕЛЬНЫМ фактом, но никогда не «приклеивать» к главному длинной цепочкой.
 
 Сохраняй только то, что потом нужно будет вспомнить. Примеры: 
 
@@ -445,6 +453,110 @@ def _enforce_fact_cap(agent, session_id, max_facts):
         logger.error(f"⚠️ remember_window: сбой применения лимита фактов: {e}")
 
 
+# ── Настройки лексического буста (крутить при отладке) ──────────────────────
+# Буст добавляется к cosine-сходству. Принцип «естественность»: чем эксклюзивнее
+# слово в памяти, тем сильнее оно тянет факт вверх (IDF по корпусу фактов).
+# Отдельный список стоп-слов НЕ ведём: частые слова («пользователь», «есть»,
+# «для») встречаются почти во всех фактах, их idf ≈ 1.0 — буст ничтожен.
+BOOST_LEXICAL_K = 0.25      # потолок буста за покрытие запроса словами факта
+BOOST_PHRASE_K = 0.12       # потолок буста за непрерывную цепочку совпавших слов
+BOOST_PHRASE_DENOM = 3.0    # шаг фразового буста: L=4+ упирается в потолок
+BOOST_ENTITY_MULT = 1.6     # во сколько раз важнее сущности (домены/цифры/имена)
+BOOST_ENTITY_K = 0.12       # потолок буста за совпавшие сущности
+BOOST_ENTITY_DENOM = 2      # скольких сущностей достаточно для потолка
+BOOST_MAX = 0.35            # общий потолок буста: лексика правит, но не заменяет семантику
+
+_TERM_RE = _re.compile(r"[а-яА-ЯёЁa-zA-Z0-9]+(?:[.@/\-][а-яА-ЯёЁa-zA-Z0-9]+)*")
+_LAT_RE = _re.compile(r"^[a-zA-Z]")
+
+
+def _tokenize_terms(text):
+    return _TERM_RE.findall(text)
+
+
+def _is_entity(token):
+    if len(token) < 2:
+        return False
+    return (any(ch in token for ch in ".@/-")
+            or any(ch.isdigit() for ch in token)
+            or bool(_LAT_RE.match(token))
+            or (token[0].isupper() and token[1:].islower()))
+
+
+def _norm_form(token):
+    if _is_entity(token):
+        return token.lower()
+    return token[:5].lower() if len(token) >= 6 else token.lower()
+
+
+def _build_idf(texts):
+    """Частотность форм по корпусу фактов. Чем реже форма — тем выше idf."""
+    n = len(texts)
+    df = {}
+    for c in texts:
+        forms = set()
+        for t in _tokenize_terms(c):
+            f = _norm_form(t)
+            if len(f) >= 3:
+                forms.add(f)
+        for f in forms:
+            df[f] = df.get(f, 0) + 1
+    return {f: math.log((n + 1.0) / (d + 1.0)) + 1.0 for f, d in df.items()}
+
+
+def _query_terms(query_text, idf):
+    """Значимые слова запроса, которые вообще есть в памяти. Те, которых нет в
+    корпусе, не могут совпасть и потому не разжижают знаменатель."""
+    out = []
+    for t in _tokenize_terms(query_text):
+        is_ent = _is_entity(t)
+        w = t.lower() if is_ent else _norm_form(t)
+        if len(w) < 3 or w not in idf:
+            continue
+        out.append((w, is_ent))
+    return out
+
+
+def _boost_fact(q_terms, fact_text, idf):
+    fact_terms = _tokenize_terms(fact_text)
+    fact_keys = set()
+    for t in fact_terms:
+        k = t.lower() if _is_entity(t) else _norm_form(t)
+        if len(k) >= 3:
+            fact_keys.add(k)
+    matched = []
+    total_weight = 0.0
+    match_weight = 0.0
+    ent_matched = 0
+    for w, is_ent in q_terms:
+        iw = idf.get(w, 0.0)
+        if iw <= 0.0:
+            continue
+        wgt = iw * (BOOST_ENTITY_MULT if is_ent else 1.0)
+        total_weight += wgt
+        if w in fact_keys:
+            match_weight += wgt
+            matched.append((w, is_ent, iw))
+            if is_ent:
+                ent_matched += 1
+    cov = (match_weight / total_weight) if total_weight > 0 else 0.0
+    lexical = BOOST_LEXICAL_K * cov
+    q_keys = set(w for w, _ in q_terms)
+    phrase_len = 0
+    cur = 0
+    for t in fact_terms:
+        k = t.lower() if _is_entity(t) else _norm_form(t)
+        if k in q_keys:
+            cur += 1
+            phrase_len = max(phrase_len, cur)
+        else:
+            cur = 0
+    phrase = BOOST_PHRASE_K * min(1.0, max(0.0, phrase_len - 1) / BOOST_PHRASE_DENOM) if phrase_len else 0.0
+    entity = BOOST_ENTITY_K * min(1.0, ent_matched / BOOST_ENTITY_DENOM)
+    total = min(lexical + phrase + entity, BOOST_MAX)
+    return matched, lexical, phrase, entity, total, phrase_len, ent_matched
+
+
 async def vector_search(query_text, top_k=5, threshold=0.30):
     """Новый слой: векторный поиск по смыслу фактов в памяти.
     Возвращает список content-ов фактов со сходством >= threshold, топ-k по убыванию.
@@ -469,18 +581,37 @@ async def vector_search(query_text, top_k=5, threshold=0.30):
             ).fetchall()
             if not rows:
                 return []
+            texts = [r["content"] for r in rows]
+            idf = _build_idf(texts)
+            q_terms = _query_terms(query_text, idf)
             ids = [r["id"] for r in rows]
             vecs = agent.store.load_memory_embeddings(ids, _embed_model())
             scored = []
+            debug = []
             for r in rows:
                 v = vecs.get(r["id"])
                 if not v:
                     continue
-                s = _cosine(qvec[0], v)
-                if s >= threshold:
-                    scored.append((s, r["content"]))
+                cos = _cosine(qvec[0], v)
+                if q_terms:
+                    matched, lexical, phrase, entity, total, plen, enm = _boost_fact(q_terms, r["content"], idf)
+                else:
+                    matched, lexical, phrase, entity, total = [], 0.0, 0.0, 0.0, 0.0
+                final = cos + total
+                scored.append((final, r["content"]))
+                debug.append((final, cos, lexical, phrase, entity, r["content"], matched, len(q_terms)))
             scored.sort(key=lambda x: x[0], reverse=True)
-            return [content for _, content in scored[:top_k]]
+            hits = [content for f, content in scored if f >= threshold][:top_k]
+            if debug:
+                logger.info("🧠 [VECTOR] запрос «%s» — фактов в памяти: %d, значимых слов запроса в памяти: %d",
+                            query_text.strip()[:60], len(rows), len(q_terms))
+                debug.sort(key=lambda x: x[0], reverse=True)
+                for final, cos, lexical, phrase, entity, content, matched, _qn in debug[:6]:
+                    mark = "✅" if final >= threshold else "—"
+                    mstr = ", ".join(f"«{w}» (idf {iw:.2f}{', сущность' if is_ent else ''})" for w, is_ent, iw in matched[:6])
+                    logger.info("🧠   %s cos %.3f + лекс %.3f + фраз %.3f + сущн %.3f = %.3f | %s | совпало: %s",
+                                mark, cos, lexical, phrase, entity, final, content[:60].replace("\n", " "), mstr or "—")
+            return hits
 
         return await loop.run_in_executor(None, _run)
     except Exception as e:

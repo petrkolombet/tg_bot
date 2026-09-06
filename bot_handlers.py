@@ -133,7 +133,7 @@ def _md_to_mdv2(text):
             out.append(ch)
             i += 1
             continue
-        if ch in "_*[]()~`>#+-=|{}.!":
+        if ch in "\\_*[]()~`>#+-=|{}.!":
             out.append("\\" + ch)
         else:
             out.append(ch)
@@ -700,7 +700,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
             
-        if used_thought_id := decision.get("used_thought_id"): await state_manager.remove_thought(used_thought_id)
+        if used_thought_id := decision.get("used_thought_id"):
+            thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
+            logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
+            await state_manager.remove_thought(used_thought_id)
+        else:
+            thought_to_record = None
         if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
         
         if reaction := decision.get("reaction"):
@@ -725,10 +730,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("🛑 генерация перебита (/stop или новое сообщение) — ответ не отправлен")
             else:
                 sent_count = 0
+                thought_written = False
                 for i, message_text in enumerate(replies):
                     sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                     if not sent:
                         continue
+                    if thought_to_record and not thought_written:
+                        await state_manager.add_thought_record(thought_to_record)
+                        thought_to_record = None
+                        thought_written = True
                     await state_manager.add_history("model", message_text)
                     sent_count += 1
                     if i < len(replies) - 1:
@@ -805,7 +815,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
         
-        if used_thought_id := decision.get("used_thought_id"): await state_manager.remove_thought(used_thought_id)
+        if used_thought_id := decision.get("used_thought_id"):
+            thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
+            logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
+            await state_manager.remove_thought(used_thought_id)
+        else:
+            thought_to_record = None
         if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
         
         if reaction := decision.get("reaction"):
@@ -818,10 +833,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         replies = _flatten_replies(decision.get("replies"))
         if replies:
             sent_count = 0
+            thought_written = False
             for i, message_text in enumerate(replies):
                 sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                 if not sent:
                     continue
+                if thought_to_record and not thought_written:
+                    await state_manager.add_thought_record(thought_to_record)
+                    thought_to_record = None
+                    thought_written = True
                 await state_manager.add_history("model", message_text)
                 sent_count += 1
                 if i < len(replies) - 1:
@@ -1033,15 +1053,24 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
             )
             decision = await process_user_input(trigger, state_manager)
             if used_thought_id := decision.get("used_thought_id"):
+                thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
+                logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
                 await state_manager.remove_thought(used_thought_id)
+            else:
+                thought_to_record = None
             replies = decision.get("replies") or []
             if not replies and (single_text := decision.get("text")):
                 if isinstance(single_text, str) and len(single_text) > 0:
                     replies = [single_text]
             if replies:
+                thought_written = False
                 for msg in replies:
                     text_to_send = msg if isinstance(msg, str) else msg.get("text", "")
                     if text_to_send:
+                        if thought_to_record and not thought_written:
+                            await state_manager.add_thought_record(thought_to_record)
+                            thought_to_record = None
+                            thought_written = True
                         await _send_md(context, config.ALLOWED_USER_ID, text_to_send)
                         await state_manager.add_history("model", text_to_send)
                         await asyncio.sleep(random.uniform(1.5, 3.0))
