@@ -17,6 +17,10 @@ API_KEYS = []
 # --- Прокси (глобальный для Playwright и пр., НЕ для провайдеров) ---
 PROXY_URL = os.getenv('PROXY_URL')
 
+# --- Прокси для Telegram (python-telegram-bot/httpx). Если задан —
+# Telegram идёт через прокси; если пуст — напрямую. Остальное не трогает. ---
+TELEGRAM_PROXY = os.getenv('TELEGRAM_PROXY')
+
 # --- Groq (для транскрипции голосовых) ---
 GROQ_KEYS = []
 _env_groq = os.getenv('GROQ_KEYS', '')

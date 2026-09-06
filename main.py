@@ -3,6 +3,7 @@
 import logging
 import os
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters
+from telegram.request import HTTPXRequest
 
 import config
 from bot_state import StateManager
@@ -43,7 +44,10 @@ def main():
     # Инициализация состояния
     state_manager = StateManager(config.STATE_FILE)
     
-    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).concurrent_updates(True).build()
+    app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).concurrent_updates(True)
+    if config.TELEGRAM_PROXY:
+        app = app.request(HTTPXRequest(proxy=config.TELEGRAM_PROXY))
+    app = app.build()
     
     # Dependency Injection: Передаем зависимости в bot_data
     # Это разрывает круг импортов: handlers не нужно импортировать bot_ai напрямую
