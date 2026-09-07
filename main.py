@@ -47,6 +47,7 @@ def main():
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).concurrent_updates(True)
     if config.TELEGRAM_PROXY:
         app = app.request(HTTPXRequest(proxy=config.TELEGRAM_PROXY, read_timeout=35, connect_timeout=20))
+        app = app.get_updates_request(HTTPXRequest(proxy=config.TELEGRAM_PROXY, read_timeout=35, connect_timeout=20))
     app = app.build()
     
     # Dependency Injection: Передаем зависимости в bot_data

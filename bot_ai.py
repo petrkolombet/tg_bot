@@ -170,7 +170,7 @@ async def safe_generate_content_g4f(prompt, temperature=0.85, image_path=None):
 
             # Логируем сырой ответ в файл
             try:
-                with open("/root/tg_bot/last_raw_response.txt", "w") as f:
+                with open(str(config.BASE_DIR / "last_raw_response.txt"), "w") as f:
                     f.write(f"=== [{provider}] Попытка {attempt+1} ===\n")
                     f.write(f"URL: {url}\n")
                     f.write(f"Модель: {providers.G4F_MODEL}\n")
@@ -964,7 +964,7 @@ async def try_parse_or_repair_json(raw_text):
 
     # Логируем сырой ответ в файл
     try:
-        with open("/root/tg_bot/last_raw_response.txt", "w") as f:
+        with open(str(config.BASE_DIR / "last_raw_response.txt"), "w") as f:
             f.write(f"=== RAW RESPONSE ({len(raw_text)} симв) ===\n")
             f.write(raw_text[:5000])
             f.write(f"\n=== END ===\n")

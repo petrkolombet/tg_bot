@@ -18,9 +18,10 @@ import os
 import re
 from pathlib import Path
 
+import config
 logger = logging.getLogger(__name__)
 
-WORKSPACE_DIR = Path("/root/tg_bot/workspace")
+WORKSPACE_DIR = config.BASE_DIR / "workspace"
 TOOLS_DIR = WORKSPACE_DIR / "tools"
 
 # Кеш: имя_тула -> {"mtime": float, "manifest": dict}
@@ -37,7 +38,7 @@ _STATE_DEFAULT_LIMIT = 8
 BUILTIN_TOOLS = {
     "shell": {
         "name": "shell",
-        "description": "Выполнение команды в sandbox (рабочая папка /root/tg_bot/workspace).",
+        "description": "Выполнение команды в sandbox (рабочая папка {}).".format(config.BASE_DIR / "workspace"),
         "methods": {
             "run": {
                 "description": "Выполнить shell-команду",

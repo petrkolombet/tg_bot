@@ -60,6 +60,9 @@ def main():
 
     tools_dir = str(Path(script_path).resolve().parent)
     sys.path.insert(0, tools_dir)
+    project_dir = str(Path(__file__).resolve().parent.parent)
+    if project_dir not in sys.path:
+        sys.path.insert(0, project_dir)
 
     spec = importlib.util.spec_from_file_location("tool_mod", script_path)
     mod = importlib.util.module_from_spec(spec)

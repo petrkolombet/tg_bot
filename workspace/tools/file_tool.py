@@ -5,10 +5,11 @@
 Ошибки метод возвращает через исключение — бот покажет их тебе.
 """
 
-WORKSPACE = "/root/tg_bot/workspace"
+WORKSPACE = str(config.BASE_DIR / "workspace")
 
 from pathlib import Path  # noqa: E402
 
+import config
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 _MIME_MAP = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
              ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp"}

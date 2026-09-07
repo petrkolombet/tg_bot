@@ -25,9 +25,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import config
 logger = logging.getLogger("browser_daemon")
 
-WORKSPACE = Path("/root/tg_bot/workspace")
+WORKSPACE = config.BASE_DIR / "workspace"
 STATE_DIR = WORKSPACE / "browser_state"
 SHOTS_DIR = WORKSPACE / "browser_shots"
 # Постоянные папки браузерных профилей (launch_persistent_context).
@@ -156,7 +157,7 @@ class BrowserManager:
         profile_path.mkdir(parents=True, exist_ok=True)
         kwargs = {
             "user_data_dir": str(profile_path),
-            "headless": True,
+            "headless": False,
             "args": [
                 "--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu",
                 "--proxy-bypass-list=<-loopback>;127.0.0.1;localhost;::1",

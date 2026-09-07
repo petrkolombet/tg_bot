@@ -1,10 +1,14 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения из .env
 load_dotenv()
 
 # ================= НАСТРОЙКИ БОТА =================
+
+BASE_DIR = Path(__file__).resolve().parent
+
 
 # --- Основные ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')

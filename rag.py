@@ -6,6 +6,7 @@ import uuid
 import math
 import urllib.parse
 
+import config
 os.environ["no_proxy"] = "127.0.0.1,localhost"
 os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 
@@ -263,7 +264,7 @@ def _cosine(a, b):
     return dot / (na * nb)
 
 
-WORKING_DIR = "/root/tg_bot/rag_storage"
+WORKING_DIR = str(config.BASE_DIR / "rag_storage")
 DB_NAME = "memorylite.sqlite3"
 
 RAG_URL = providers.RAG_URL

@@ -14,10 +14,11 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+import config
 logger = logging.getLogger(__name__)
 
-WORKSPACE = Path("/root/tg_bot/workspace")
-LOG_FILE = "/root/tg_bot/server_access.log"
+WORKSPACE = config.BASE_DIR / "workspace"
+LOG_FILE = str(config.BASE_DIR / "server_access.log")
 
 # Мониторинг — разрешённые команды (read-only, безопасные)
 MONITORING_CMDS = {

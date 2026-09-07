@@ -636,7 +636,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Сохраняем в saved_proxies.json если ещё нет
         try:
-            with open("/root/tg_bot/saved_proxies.json", "r") as f:
+            with open(str(config.BASE_DIR / "saved_proxies.json"), "r") as f:
                 saved = json.load(f)
         except Exception:
             saved = []
@@ -652,7 +652,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "user": parts[2],
                 "pass": parts[3],
             })
-            with open("/root/tg_bot/saved_proxies.json", "w") as f:
+            with open(str(config.BASE_DIR / "saved_proxies.json"), "w") as f:
                 json.dump(saved, f, indent=2, ensure_ascii=False)
 
         await update.message.reply_text(
@@ -1092,8 +1092,8 @@ async def handle_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cmd_text:
         await update.message.reply_text(
             "команда: /server <shell-команда>\n\n"
-            "workspace (/root/tg_bot/workspace) — чтение/запись/запуск\n"
-            "вне workspace — только чтение и мониторинг"
+            "workspace ({}) — чтение/запись/запуск\n".format(str(config.BASE_DIR / "workspace"))
+            + "вне workspace — только чтение и мониторинг"
         )
         return
 
@@ -1680,7 +1680,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Загружаем сохранённые прокси
         try:
-            with open("/root/tg_bot/saved_proxies.json", "r") as f:
+            with open(str(config.BASE_DIR / "saved_proxies.json"), "r") as f:
                 saved = json.load(f)
         except Exception:
             saved = []
@@ -1739,7 +1739,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif mode == "saved":
             idx = int(parts[3])
             try:
-                with open("/root/tg_bot/saved_proxies.json", "r") as f:
+                with open(str(config.BASE_DIR / "saved_proxies.json"), "r") as f:
                     saved = json.load(f)
                 sp = saved[idx]
                 proxy_str = f"{sp['host']}:{sp['port']}:{sp['user']}:{sp['pass']}"
