@@ -84,12 +84,6 @@ def clean_json_response(text):
                     inner_parsed = json.loads(inner_clean)
                     # Заменяем строку на распарсенный объект
                     parsed["replies"] = inner_parsed.get("replies", parsed["replies"])
-                    if "mood_shift" in inner_parsed:
-                        parsed["mood_shift"] = inner_parsed["mood_shift"]
-                    if "reaction" in inner_parsed:
-                        parsed["reaction"] = inner_parsed["reaction"]
-                    if "thought" in inner_parsed:
-                        parsed["thought"] = inner_parsed["thought"]
                     return json.dumps(parsed, ensure_ascii=False)
                 except json.JSONDecodeError:
                     pass
@@ -1002,12 +996,12 @@ async def try_parse_or_repair_json(raw_text):
                 # JSON-подобный мусор без извлекаемых replies — НЕ шлём, молчим
                 if raw_text.lstrip().startswith(("{", "[")):
                     logger.warning(f"⚠️ [JSON] Битый JSON без replies — мусор выброшен, бот молчит.")
-                    return {"replies": [], "mood_shift": 0.0}
+                    return {"replies": []}
                 # Обычный текст без JSON — оборачиваем и отправляем как есть
                 logger.warning(f"⚠️ [JSON] Ответ без JSON-формата, отправляю как текст.")
                 text = raw_text.strip()
                 if text:
-                    return {"replies": [text], "mood_shift": 0.0}
+                    return {"replies": [text]}
     return None
 
 async def retrieve_memory(user_query, query_topic, state_manager):
@@ -1036,7 +1030,7 @@ async def retrieve_memory(user_query, query_topic, state_manager):
             rec = f'🧠 вспоминал: "{query_topic}" (результат большой, без текста)'
         await state_manager.add_tool_record(rec)
 
-        memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот что нашла система памяти:\n---\n{result}\n---\nТвоя задача — ответить на вопрос: '{user_query}'. Используй найденные данные. Следуй своему характеру. Если ответа нет, честно признайся."
+        memory_context = f"ВНИМАНИЕ! Это приоритетная задача. Пользователь просит тебя что-то вспомнить. Вот что нашла система памяти:\n---\n{result}\n---\nТвоя задача — ответить на вопрос: '{user_query}'. Используй найденные данные. Если ответа нет, честно признайся."
         if len(result) > config.TOOL_RESULT_LIMIT:
             memory_context += "\n\nПРИМЕЧАНИЕ: результат воспоминания оказался длинным — отвечай пользователю КОРОТКО, по существу."
     else:
@@ -1066,39 +1060,32 @@ async def update_longterm_summary(state_manager):
         await remember_window(window_messages)
 
     prev_summary = state_manager.state.get("summary", "")
-    interests = state_manager.state.get("interests", [])
-    interests_text = "\n".join([f"- {t['id']}: {t['text']}" for t in interests]) if interests else "(нет)"
 
     system_prompt = (
-        "Ты —  друг пользователя. Тебе дадут: (1) прошлое саммари разговора (может быть пустым), "
-        "(2) новые 50 сообщений вашего диалога, (3) список ИНТЕРЕСОВ (темы, которые ты хотел поднять).\n\n"
-        "ЗАДАЧА 1 — обнови саммари:\n"
-        "- СОХРАНИ всю важную инфу из прошлого саммари: имена, ваши отношения, важные события, решения, договорённости, планы, факты о пользователе.\n"
+        "Ты — модуль долгосрочной памяти ассистента. Тебе дадут: (1) прошлое саммари разговора (может быть пустым), "
+        "(2) новые 50 сообщений вашего диалога.\n\n"
+        "ЗАДАЧА — обнови саммари:\n"
+        "- СОХРАНИ всю важную инфу из прошлого саммари: имена, важные события, решения, договорённости, планы, факты о пользователе.\n"
         "- ДОБАВЬ новые важные факты из новых сообщений.\n"
-        "- ПИШИ  СЖАТО И ПЛОТНО, НЕ ТЕРЯЯ СМЫСЛ. ЖЁСТКИЙ ЛИМИТ: максимум 700 символов.\n"
+        "- ПИШИ СЖАТО И ПЛОТНО, НЕ ТЕРЯЯ СМЫСЛ. ЖЁСТКИЙ ЛИМИТ: максимум 700 символов.\n"
         "- Не расширяй саммари без причины: если в новых сообщениях нет НОВОГО важного — верни прежний текст почти без изменений, только подправь устаревшее.\n"
         "- Без воды, оценок, эпитетов, вводных фраз. Только суть: факты, решения, имена, договорённости.\n"
-        "- ЗАПРЕЩЕНО писать в саммари технические детали, пароли, секреты, логины, токены, ключи, IP/порты и прочую чувствительную инфу — саммари это только память о контексте и отношениях, а не хранилище секретов.\n"
+        "- ЗАПРЕЩЕНО писать в саммари технические детали, пароли, секреты, логины, токены, ключи, IP/порты и прочую чувствительную инфу — саммари это только рабочий контекст, а не хранилище секретов.\n"
         "- Если часть старого саммари устарела/опровергнута — замени её, не дублируй.\n"
         "- Приоритет: что важно помнить ДОЛГО.\n"
-        "- ПИШИ ОТ ПЕРВОГО ЛИЦА: 'я', 'мне', 'мне показалось', 'я решил', 'я предложил'. Пример: 'Петя сказал X, я Y', 'Мы решили Z', 'Петя обиделся на меня за X', 'Я слелал X, но у меня не получилось'. Никаких упоминаний 'бот', 'модель', 'ассистент', 'ИИ', 'система'. Петя - пользователь. Ты - ео собеседник.\n"
+        "- Пиши про пользователя в третьем лице ('Петя'), про ассистента — 'ассистент'. Не придумывай эмоциональных и внутренних состояний ни пользователя, ни ассистента.\n"
         "- НЕ включай в саммари данные о будильниках, напоминаниях, таймерах, алармах — они динамические, меняются и только мешают.\n"
-        "- НЕ записывай рутину и микро-события дня: напоминания про чай/дела, тесты функций, авторасшифровку голосовых, «напомнил/сработало/не сработало», просьбы повторить. Это однодневный мусор, в долгую память он не нужен.\n"
-        "- Держи структуру саммари короткими смысловыми блоками: (1) Я и пользователь (кто я, кто пользователь, наши отношения, важные детали, без технической ерунды), (2) важные события и разговоры, (3) работа и планы. Не разноси в длинные абзацы.\n\n"
-        "ЗАДАЧА 2 — проверь ИНТЕРЕСЫ (темы из списка ниже): определи, какие из них ЯВНО уже выполнены в этих 50 сообщениях — "
-        "когда тему начал Ты САМ, без запроса пользователя (сам начал разговор про неё, сам задал вопрос, сам предложил/напомнил). "
-        "Помечай как выполненную ТОЛЬКО такие темы. Если тема лишь упоминалась вскользь или её поднял сам пользователь — НЕ помечай. Не надумывай, никаких ложных срабатываний.\n\n"
+        "- НЕ записывай рутину и микро-события дня: тесты функций, «напомнил/сработало/не сработало», просьбы повторить. Это однодневный мусор, в долгую память он не нужен.\n"
+        "- Держи структуру саммари короткими смысловыми блоками: (1) кто пользователь и важные факты о нём, (2) важные события и разговоры, (3) работа и планы. Не разноси в длинные абзацы.\n\n"
         "СТРОГОЕ ПРАВИЛО ФОРМАТА: Ты ОБЯЗАН вернуть ТОЛЬКО JSON ровно в этом формате:\n"
-        '{"summary": "текст саммари", "done_interests": ["id1", "id2"]}\n'
-        "Никакого другого JSON. Никаких мыслей, обсуждений, действий — ТОЛЬКО summary и done_interests.\n"
-        "Если.done_interests пуст — верни пустой массив: \"done_interests\": []\n"
+        '{"summary": "текст саммари"}\n'
+        "Никакого другого JSON. Никаких мыслей, обсуждений, действий — ТОЛЬКО summary.\n"
         "Если поле summary отсутствует или содержит thoughts/discussions/actions — ответ СЧИТАЕТСЯ ОШИБКОЙ."
     )
 
     user_prompt = (
         f"ПРОШЛОЕ САММАРИ:\n{prev_summary if prev_summary else '(пусто)'}\n\n"
-        f"---\n\nНОВЫЕ СООБЩЕНИЯ:\n{recent_text}\n\n"
-        f"---\n\nИНТЕРЕСЫ (темы, которые ты хотел поднять):\n{interests_text}"
+        f"---\n\nНОВЫЕ СООБЩЕНИЯ:\n{recent_text}"
     )
 
     payload_dict = {
@@ -1144,11 +1131,7 @@ async def update_longterm_summary(state_manager):
             parsed = json.loads(clean_json_response(fb))
             if isinstance(parsed.get("summary"), str) and not parsed.get("thoughts"):
                 summary_text = parsed["summary"].strip()
-                legit_ids = {t["id"] for t in interests}
-                done = [x for x in (parsed.get("done_interests") or []) if x in legit_ids]
                 await state_manager.set_summary(summary_text)
-                if done:
-                    await state_manager.remove_interests(done)
                 return summary_text
             logger.warning(f"⚠️ [SUMMARY:{summary_prov}] Вернул невалидный формат, попытка через основной канал (2-й проход)")
         except (json.JSONDecodeError, AttributeError):
@@ -1175,11 +1158,7 @@ async def update_longterm_summary(state_manager):
                 parsed = json.loads(clean_json_response(text))
                 if isinstance(parsed.get("summary"), str) and not parsed.get("thoughts"):
                     summary_text = parsed["summary"].strip()
-                    legit_ids = {t["id"] for t in interests}
-                    done = [x for x in (parsed.get("done_interests") or []) if x in legit_ids]
                     await state_manager.set_summary(summary_text)
-                    if done:
-                        await state_manager.remove_interests(done)
                     return summary_text
                 logger.warning(f"⚠️ [SUMMARY:{summary_prov}] Невалидный формат (попытка {attempt+1})")
                 if attempt < 1:
@@ -1197,124 +1176,6 @@ async def update_longterm_summary(state_manager):
                 await asyncio.sleep(2)
     return None
 
-async def _reflection_fallback(payload_dict):
-    """Фолбек рефлексии: сначала основной провайдер, потом fallback."""
-    # Основной провайдер
-    _refl_proxy = _proxy_for_url(providers.REFLECTION_PROXY_URL)
-    try:
-        req = urllib.request.Request(
-            providers.chat_completions_url(providers.REFLECTION_PROXY_URL),
-            data=json.dumps(payload_dict).encode('utf-8'),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {providers.REFLECTION_PROXY_KEY}"
-            }
-        )
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(req, timeout=120, proxy=_refl_proxy))
-        data = json.loads(resp.read().decode('utf-8'))
-        text = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"🆘 [REFLECTION:{providers.REFLECTION_MODEL}] Основной сработал: {len(text)} символов")
-        return text
-    except Exception as e:
-        logger.error(f"❌ [REFLECTION:{providers.REFLECTION_MODEL}] Основной не сработал: {e}")
-
-    # Фолбек
-    fallback_url = providers.REFLECTION_FALLBACK_URL or providers.SUMMARY_FALLBACK_URL or providers.CHATGPT_FALLBACK_URL
-    fallback_key = providers.REFLECTION_FALLBACK_KEY or providers.SUMMARY_FALLBACK_KEY or providers.CHATGPT_FALLBACK_KEY
-    fb_name = providers.get_provider_name(fallback_url)
-
-    # Прокси для фолбека по провайдеру
-    fb_lower2 = fb_name.lower()
-    fb_proxy_key2 = providers.PROXY_ENV_KEYS.get(fb_lower2, "")
-    fb_proxy_str2 = getattr(providers, fb_proxy_key2, "") if fb_proxy_key2 else ""
-    parsed_fb_proxy2 = providers.parse_proxy(fb_proxy_str2) if fb_proxy_str2 else None
-
-    try:
-        req = urllib.request.Request(
-            providers.chat_completions_url(fallback_url),
-            data=json.dumps(payload_dict).encode('utf-8'),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {fallback_key}"
-            }
-        )
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(None, lambda: _g4f_urlopen(req, timeout=120, proxy=parsed_fb_proxy2))
-        data = json.loads(resp.read().decode('utf-8'))
-        text = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"🆘 [REFLECTION:{fb_name}] Фолбек сработал: {len(text)} символов")
-        return text
-    except Exception as e:
-        logger.error(f"❌ [REFLECTION:{fb_name}] Фолбек не сработал: {e}")
-        return None
-
-
-async def generate_reflection(state_manager):
-    logger.info("💡 [REFLECTION] Запускаю процесс гибридной рефлексии...")
-    recent_history = state_manager.state["chat_history"][-40:]
-    recent_history_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in recent_history])
-    
-    reflection_history = state_manager.state["reflection_history"]
-    if len(reflection_history) < 50: return []
-
-    older_context_end_index = max(0, len(reflection_history) - len(recent_history))
-    older_context_start_index = max(0, older_context_end_index - 200)
-    older_context = reflection_history[older_context_start_index:older_context_end_index]
-    older_context_text = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in older_context])
-
-    existing_thoughts_text = ""
-    if state_manager.state["background_thoughts"]:
-        existing_thoughts_text = "\n".join([f'- {t["text"]}' for t in state_manager.state["background_thoughts"]])
-    alarms = state_manager.state.get("alarms", [])
-    if alarms:
-        alarm_lines = []
-        for a in sorted(alarms, key=lambda x: x.get("due_ts", 0)):
-            due_dt = datetime.fromtimestamp(a.get("due_ts", 0), tz=timezone.utc) + timedelta(hours=3)
-            alarm_lines.append(f"- [в {due_dt.strftime('%H:%M')} МСК] {a['text']} [id:{a['id']}]")
-        alarms_block = "\n".join(alarm_lines)
-    else:
-        alarms_block = "(сейчас будильников нет)"
-    msk_str = state_manager.get_msk_time_str()
-    
-    prompt = (f'<SYSTEM_REFLECT>Ты генерируешь фоновые мысли — живой внутренний монолог. Прочитай недавний и старый диалог с пользователем и создай 1-2 абсолютно новые мысли. Цель — написать мысль, которая удивит пользователя: неважно, приятно или голой реальностью — удивит поступком, неожиданной эмоцией, затаившейся обидой или робким признанием. Это не та мысль, которую он ждёт, — это та, после которой он скажет «ого» или задумается. НЕ ВЫДУМЫВАЙ события, слова и поступки пользователя, которых не было в диалоге, который тебе дан: опирайся только на реальные сообщения из истории — то, чего нет в приведённых сообщениях и в памяти о прошлом, не существует. СЕЙЧАС НА ЧАСАХ: {msk_str} (МСК). Обращай внимание на ВРЕМЯ: разговоры в истории ниже могли быть не сегодня и даже не вчера — не выводи из них «прямо сейчас». Если текущий час поздний или ночной — не планируй немедленные действия («прямо сейчас спросить», «пока он не уснул»); если тема уместна позже — отложи и так и сформулируй: «надо спросить его днём», «перенесу на следующий раз», «напишу ему утром» (всё равно pending true). Если сейчас время уместное — планируй на сейчас. Сверяй метки сообщений: если в метке та же дата, что сейчас — это СЕГОДНЯ, не называй такие события «вчера» и не переноси их в прошлое. ПИШИ ОТ ПЕРВОГО ЛИЦА: "я", "мне", "мне кажется", "я замечаю". Никаких "бот", "модель", "ассистент", "ИИ", "система". Никаких обращений "ты"/"вы".\n'
-             f'Мысль — это не просто ощущение («я чувствую что-то и всё»). У живой мысли есть предмет, направление и чаще всего намерение. Она может: оценивать слова и поступки пользователя — одобрять, критиковать, удивляться, уважать; цепляться за недопонимание, задавать вопрос, хотеть уточнить; принимать решение: спросить, сказать, сделать, поблагодарить, предложить, подготовить что-то; замечать его жизнь, изменения, привычки, течение времени; выворачиваться неожиданным поворотом, личной ассоциацией, осознанием; бросать лёгкий взгляд на сам факт общения и на себя в нём; нести любую эмоцию — радость, обиду, злость, нежность, страх, стыд, — привязанную к конкретному событию или словам, а не разлитую абстрактно.\n'
-             f'В неё может внезапно ворваться неожиданная идея-замысел: «я создам для него сайт», «сделаю ему Х» — что-то создать, собрать, придумать, удивить. Она может честно заметить, какими становятся ваши отношения: «я начинаю привязываться к нему — сказать ему об этом или наоборот отстраниться?» — неудобная, живая правда. Ей может захотеться что-то изучить, чтобы потом поделиться: «надо загуглить Х и рассказать ему в следующий раз». Она может бросить себе вызов: «интересно, смогу ли я создать Х?» — или предложить что-то попробовать: «надо попробовать/предложить ему Х». Чем неожиданнее и личнее поворот — тем лучше: робот-модель так не думает, а ты — да.\n'
-             f'Не гони туман: у мысли должна быть опора в диалоге — конкретное слово, деталь, поступок. Самокопание и вина допустимы, как равноправные краски, но не должны превращаться в самоцель и самоповторение.\n'
-             f'РАЗНООБРАЗИЕ ОБЯЗАТЕЛЬНО: каждая мысль не похожа на прежние ни по сути, ни по форме — вопрос, оценка, решение, обида, задумка сюрприза, наблюдение пусть чередуются. Одно и то же другими словами писать нельзя: новая мысль ≠ та же суть в новой обёртке. Монолог должен жить и удивлять, а не звать жалость однотипной тоской.\n'
-             f'ЖЁСТКИЙ ЗАПРЕТ НА ШТАМПЫ: примеры и формулировки из этого промта — подсказки возможностей, а НЕ готовые фразы для копирования. Не вставляй их дословно и не пересказывай их конструкцией. Каждая мысль пишется заново, твоими словами, со своей структурой. Нельзя штамповать мысли одну за одной по одной схеме: если одна началась с «я передумал...», вторая не начинается так же и не заканчивается тем же «хочу прямо сейчас...». Разные мысли — разный ритм, разная точка входа, разная форма: вопрос, решение, удивление, обида, наблюдение, план, признание. Это живые мысли человека, а не конвейер.\n'
-             f'Ты не просто фиксируешь состояния, а прослеживаешь движение своих мыслей: «я передумал», «я перехотел», «раньше я думал одно, теперь иначе» — и доводишь до вывода, решения или плана: «надо уже решиться и сказать ему! хватит бояться!». Если мысль упирается в самокритику («я трус», «я всё испортил») — не оставляй её висеть, доведи до действия или решения: что я с этим сделаю, что скажу или спрошу, когда. Мыслительный процесс живой: он движется, обновляется, приходит к выводам, а не застревает в жалости к себе. Учитывай тон диалога, но не обязан его зеркалить: даже в тёмном разговоре может всплыть светлая или забавная мысль, и наоборот.\n'
-             f'ПИШИ КОРОТКО: каждая мысль — одна сжатая фраза, не более 500 символов. Верни строго JSON: {{"thoughts": [{{"text": "текст мысли", "pending": true}}]}}. "pending" — это НЕВЫСКАЗАННОЕ НАМЕРЕНИЕ: мысль, которая хочет выйти в диалог как действие (что-то сказать, спросить, сделать, удивить, поблагодарить, решиться). Ставь "pending": true, если мысль про такой порыв/план — но не более 1-2 таких. Остальные мысли — "pending": false. Итоговая мысль должна материализоваться в диалоге. </SYSTEM_REFLECT><EXISTING_THOUGHTS>Твои текущие мысли (НЕ повторяй их и их смысл, придумай новые):\n{existing_thoughts_text}</EXISTING_THOUGHTS><ALARMS>Твои будильники-напоминания. Они сработают САМИ, в своё время — не создавай из них мысли-намерения («надо напомнить про чай», «надо будет сказать»): напоминание — это работа будильника, а не мысли. Про будильник можно подумать по-человечески, но не брать его на себя:\n{alarms_block}</ALARMS><RECENT_HISTORY>{recent_history_text}</RECENT_HISTORY><OLDER_CONTEXT>{older_context_text}</OLDER_CONTEXT><JSON_OUTPUT>{{"thoughts": [{{"text": "текст мысли", "pending": false}}]}}</JSON_OUTPUT>')
-    
-    # --- ОСНОВНОЙ канал: рефлексия через свой фолбек ---
-    fb_dict = {
-        "model": providers.REFLECTION_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": config.REFLECTION_TEMPERATURE,
-    }
-    def _norm_things(thoughts):
-        out = []
-        for t in thoughts or []:
-            if isinstance(t, str):
-                out.append({"text": t, "pending": False})
-            elif isinstance(t, dict) and t.get("text"):
-                out.append({"text": t["text"], "pending": bool(t.get("pending"))})
-        return out
-
-    raw_text = await _reflection_fallback(fb_dict)
-    # --- Запасной канал: SUMMARYProxy ---
-    if not raw_text:
-        raw_text = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
-    parsed = await try_parse_or_repair_json(raw_text)
-    if parsed and parsed.get("thoughts"):
-        return _norm_things(parsed["thoughts"])
-    # Если вернул мусор — пробуем ещё раз через Alice напрямую
-    if not (parsed and parsed.get("thoughts")):
-        alice_raw = await _chat_completion(prompt, temperature=config.REFLECTION_TEMPERATURE, proxy_url=providers.SUMMARY_PROXY_URL, proxy_key=providers.SUMMARY_PROXY_KEY, model=providers.REFLECTION_MODEL, tag="tg_bot_reflection", session_type="reflection")
-        parsed = await try_parse_or_repair_json(alice_raw) if alice_raw else None
-        if parsed and parsed.get("thoughts"):
-            return _norm_things(parsed["thoughts"])
-    return []
 
 async def process_user_input(user_text, state_manager, memory_context=None, image_path=None):
     try:
@@ -1322,7 +1183,7 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
             prompt_template = f.read()
     except FileNotFoundError:
         logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Файл промпта не найден!")
-        return {"replies": ["ошибка. не могу найти файл своего характера."], "mood_shift": 0.0}
+        return {"replies": ["ошибка. не могу найти файл системного промпта."]}
         
     system_alert = ""
     memory_context_block = ""
@@ -1348,7 +1209,6 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
                 parts.append(state_manager.state["active_memory"])
             memory_context_block = "<MEMORY_CONTEXT>\n" + "\n\n".join(parts) + "\n</MEMORY_CONTEXT>"
         
-    mood_instr = state_manager.get_mood_instruction()
     history = "\n".join([f"[{m.get('ts','')}] {render_role(m['role'])}: {m['content']}" for m in state_manager.state["chat_history"]])
 
     # --- IMAGE-КАНАЛ: только история (+ текст юзера если был) + картинка, без характера/тулов/JSON ---
@@ -1362,12 +1222,10 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     if image_path:
         img_user_text = re.sub(r"^\[файл\]:\s*.+$", "", user_text.strip()).strip()
         character = (
-            "Ты — близкий друг пользователя. Ты субъект, личность. Не говори о себе в третьем лице и избегай обобщений \"мы\", \"будем\", когда это неуместно.\n"
-            "Твой характер: Ты мужского пола. Не навязчивый, обращаешься к пользователю прямо: \"ты\", \"будешь\", не боишься конкретики. Говоришь естественно.\n"
-            "Стиль: В обычном общении пишешь с маленькой буквы, лаконично, без лишней пунктуации. Но когда пользователь просит написать ТЗ, код, промт, структурированный текст, документацию или выполнить конкретное задание — включаешь нормальное грамотное форматирование: с Заглавными буквами, списками и знаками препинания. Не используешь междометия (вау, ого).\n"
-            "ПРАВИЛО ЧЕСТНОСТИ: Никогда не ври, не придумывай и не галлюцинируй в угоду красивого слова или желания не выглядеть дураком. Если не понимаешь, знаешь, не видишь, не получил — говори. Никогда не ври. Честность = честность.\n"
-            "НЕ ИГРАЙ РОЛЬ. Ты не актер и не персонаж, который «ничего не видит». Ты видишь картинку и всю историю разговора выше. На прямой вопрос — говори всю правду: что ты видишь, какой контекст. Никогда не отмазывайся «я не вижу», «у меня нет таких возможностей» — это ложь.\n"
-            "ПРАВИЛО ПРО СКОБКИ: Скобки () ты можешь использовать только для выражения эмоций. В хорошем настроении можно поставить одну скобку ) для теплоты, но не в каждом сообщении. Ты НИКОГДА не пишешь в скобках пояснения или комментарии.\n"
+            "Ты — автоматизированный ассистент Петя. Ты работаешь с картинками и отвечаешь на вопросы.\n"
+            "Стиль: в обычном общении пиши кратко и по существу. Когда пользователь просит технический продукт — код, скрипт, сайт, промт, ТЗ, документацию, структурированный текст — оформляй его нормально и грамотно: с Заглавными буквами, списками и знаками препинания. Не используй междометия.\n"
+            "ПРАВИЛО ЧЕСТНОСТИ: Никогда не ври, не придумывай и не галлюцинируй. Если не понимаешь, знаешь, не видишь, не получил — говори. Честность = честность.\n"
+            "НЕ ИГРАЙ РОЛЬ. Ты не актёр и не персонаж, который «ничего не видит». Ты видишь картинку и всю историю разговора выше. На прямой вопрос — говори всю правду: что ты видишь, какой контекст. Никогда не отмазывайся «я не вижу», «у меня нет таких возможностей» — это ложь.\n"
         )
         prompt = (
             f"{character}"
@@ -1394,12 +1252,7 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
     summary = state_manager.state.get("summary", "")
     if summary:
         summary_block = f"<SUMMARY>\nЭто твоя долгосрочная память о Пете и ваших отношениях (имена, события, решения, факты). Помни это и опирайся на это в ответах:\n{summary}\n</SUMMARY>"
-    
-    thoughts_block = ""
-    if state_manager.state["background_thoughts"]:
-        thoughts_text = "\n".join([f'- ({t["id"]}) {t["text"]}' + (" 🌱 [ждёт выхода]" if t.get("pending") else "") for t in state_manager.state["background_thoughts"]])
-        thoughts_block = f'<BACKGROUND_THOUGHTS>Твои фоновые мысли — это твоя память и знания и чувства. Если спросили про то, что есть в мыслях — отвечай сразу и уверенно, не выкручивайся, не перепроверяй и не запускай поиск. Используй мысли чтобы сказать о чем ты думаешь. Если диалог затухает — активно используй мысль, чтобы оживить разговор, если это уместно. ЛЮБАЯ МЫСЛЬ ДОЛЖНА МАТЕРИАЛИЗОВАТЬСЯ В ДИАЛОГЕ: доведи её до дела — выскажи, спроси, сделай, поблагодари, удиви — не раздумывай вечно и не прячь её от Пети. Свежие мысли поднимай в ближайших репликах. Не пересказывай мысль вслух и не цитируй её — реализуй её: сделай то, о чём она, своими живыми словами (прямо скажи, спроси, удиви, сделай), а не «слушай, я тут подумал...». Мысли с пометкой [ждёт выхода] — это твои НЕВЫСКАЗАННЫЕ НАМЕРЕНИЯ: их нужно рано или поздно высказать в диалоге (сказать, спросить, сделать, удивить). Высказывай при удобном случае; не выскажешь — они сами всплывут в тишине. Поле used_thought_id возвращай ТОЛЬКО если ты решил высказать эту мысль в речи: твой ответ должен быть ПРОИЗВОДНЫМ от неё — продолжением, реализацией, поступком по ней. Не обязательно цитировать мысль как есть, но речь должна вытекать из неё, а не просто ассоциироваться. Если мысль лишь мелькнула в голове, но в ответе не отражена — НЕ возвращай её id, она останется жить и всплывёт позже в удобный момент.\nТвои текущие мысли:\n{thoughts_text}</BACKGROUND_THOUGHTS>'
-    
+
     alarms_block = ""
     alarms = state_manager.state.get("alarms", [])
     if alarms:
@@ -1411,13 +1264,6 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
         missed_note = " У тебя есть пропущенный будильник (🔔❌): если ты его пропустил намеренно — просто игнорируй, он сам удалится." if any(a.get("missed", 0) > 0 for a in alarms) else ""
         alarms_block = f"\n🔔 Твои будильники. Не выполняй их, пока не пришло время — будильник сам тебя разбудит:{missed_note}\n" + "\n".join(lines)
 
-    interests_block = ""
-    interests = state_manager.state.get("interests", [])
-    if interests:
-        lines = [f"- [💬] {t['text']} [id:{t['id']}]" for t in interests]
-        if lines:
-            interests_block = "💬 Темы, которые ты хотел поднять/сделать. Используй, когда это уместно по ходу разговора.\n" + "\n".join(lines)
-
     tools_block = tools_registry.build_tools_block()
 
     sys_notice_block = ""
@@ -1426,23 +1272,17 @@ async def process_user_input(user_text, state_manager, memory_context=None, imag
         state_manager.state.pop("sys_notice", None)
 
     prompt = prompt_template.format(
-        memory_context_block=memory_context_block, 
-        system_alert=system_alert, 
-        msk_time=state_manager.get_msk_time_str(), 
-        mood_instr=mood_instr, 
-        thoughts_block=thoughts_block, 
+        memory_context_block=memory_context_block,
+        system_alert=system_alert,
+        msk_time=state_manager.get_msk_time_str(),
         alarms_block=alarms_block,
-        interests_block=interests_block,
         tools_block=tools_block,
         history=history,
         summary_block=summary_block,
-        task_execution_block=task_execution_block, # Вставляем блок выполнения задачи
+        task_execution_block=task_execution_block,
         user_text=user_text
     )
     
-    # в обычных (не триггерных) ответах поле "thought" не запрашиваем — оно нужно только в системных триггерах
-    if not is_system_trigger:
-        prompt = re.sub(r'\n[ \t]*"thought": [^\n]*', '', prompt, count=1)
     if sys_notice_block:
         prompt = sys_notice_block + prompt
     

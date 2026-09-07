@@ -675,7 +675,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.bot_data["gen_task"] = asyncio.current_task()
 
     try:
-        await state_manager.check_and_apply_peak_decay()
         await state_manager.add_history("user", user_text)
         await state_manager.update_interaction()
 
@@ -701,25 +700,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
             
-        if used_thought_id := decision.get("used_thought_id"):
-            thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
-            logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
-            await state_manager.remove_thought(used_thought_id)
-        else:
-            thought_to_record = None
-        if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
-        
-        if reaction := decision.get("reaction"):
-            try:
-                from telegram import ReactionTypeEmoji
-                await update.message.set_reaction([ReactionTypeEmoji(reaction)])
-            except Exception as e:
-                logger.warning(f"⚠️ [REACTION] Ошибка: {e}")
-        
-        if interest_text := decision.get("add_interest"):
-            if isinstance(interest_text, str) and interest_text.strip():
-                await state_manager.add_interest(interest_text.strip())
-        
         replies = _flatten_replies(decision.get("replies"))
         if not replies and (single_text := decision.get("text")):
             if isinstance(single_text, str) and len(single_text) > 0:
@@ -731,15 +711,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info("🛑 генерация перебита (/stop или новое сообщение) — ответ не отправлен")
             else:
                 sent_count = 0
-                thought_written = False
                 for i, message_text in enumerate(replies):
                     sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                     if not sent:
                         continue
-                    if thought_to_record and not thought_written:
-                        await state_manager.add_thought_record(thought_to_record)
-                        thought_to_record = None
-                        thought_written = True
                     await state_manager.add_history("model", message_text)
                     sent_count += 1
                     if i < len(replies) - 1:
@@ -791,7 +766,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         logger.info(f"🎤-> Текст: {text}")
-        await state_manager.check_and_apply_peak_decay()
         await state_manager.add_history("user", f"[расшифровка голосового]: {text}")
         await state_manager.update_interaction()
 
@@ -816,33 +790,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(random.choice(config.FALLBACK_PHRASES))
             return
         
-        if used_thought_id := decision.get("used_thought_id"):
-            thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
-            logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
-            await state_manager.remove_thought(used_thought_id)
-        else:
-            thought_to_record = None
-        if (shift := float(decision.get("mood_shift", 0.0))) != 0.0: await state_manager.apply_reaction(shift)
-        
-        if reaction := decision.get("reaction"):
-            try:
-                from telegram import ReactionTypeEmoji
-                await update.message.set_reaction([ReactionTypeEmoji(reaction)])
-            except Exception as e:
-                logger.warning(f"⚠️ [REACTION] Ошибка: {e}")
-        
         replies = _flatten_replies(decision.get("replies"))
         if replies:
             sent_count = 0
-            thought_written = False
             for i, message_text in enumerate(replies):
                 sent = await _send_md(context, user_id, message_text, reply_to_message_id=update.message.message_id)
                 if not sent:
                     continue
-                if thought_to_record and not thought_written:
-                    await state_manager.add_thought_record(thought_to_record)
-                    thought_to_record = None
-                    thought_written = True
                 await state_manager.add_history("model", message_text)
                 sent_count += 1
                 if i < len(replies) - 1:
@@ -964,16 +918,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
     state_manager = context.bot_data["state_manager"]
     process_user_input = context.bot_data["process_user_input"]
-    generate_reflection = context.bot_data["generate_reflection"]
     update_longterm_summary = context.bot_data["update_longterm_summary"]
     
     now_ts = datetime.datetime.now(timezone.utc).timestamp()
-
-    # Естественное затухание/дрейф настроения (вызывается каждый тик, дрейф привязан ко времени)
-    try:
-        await state_manager.update_physics()
-    except Exception:
-        logger.error("💥 [CRON] Ошибка в физике настроения!", exc_info=True)
 
     # Обновление долгосрочного саммари каждые 50 сообщений
     try:
@@ -982,14 +929,6 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.error("💥 [CRON] Ошибка в обновлении саммари!", exc_info=True)
     
-    try:
-        if (now_ts - state_manager.state["last_interaction"]) > config.SILENCE_BEFORE_REFLECTION_HOURS * 3600 and \
-           (now_ts - state_manager.state["last_reflection_time"]) > config.REFLECTION_INTERVAL_HOURS * 3600:
-            thoughts = await generate_reflection(state_manager)
-            await state_manager.add_thoughts(thoughts)
-    except Exception:
-        logger.error("💥 [CRON] Ошибка в процессе рефлексии!", exc_info=True)
-
     try:
         alarms = state_manager.state.get("alarms", [])
         due_alarms = sorted([a for a in alarms if now_ts >= a.get("due_ts", now_ts + 1)], key=lambda x: x.get("due_ts"))
@@ -1025,61 +964,6 @@ async def background_tasks(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"⏰ [ALARM] Бот промолчал по будильнику '{alarm_text}' — помечаю пропущенным.")
                 await state_manager.bump_alarm_missed(alarm)
             return
-
-        # Темы (мягкие намерения) — раз в 30 минут, только в затяжной тишине
-        can_followup, reason = await state_manager.try_interest_followup(
-            cooldown_minutes=config.INTEREST_FOLLOWUP_COOLDOWN_MINUTES,
-            silence_minutes=config.SILENCE_BEFORE_PROACTIVE_MINUTES,
-            now_ts=now_ts
-        )
-        if can_followup:
-            topics = [f"- {t['text']} [id:{t['id']}]" for t in state_manager.state["interests"]]
-            topics_str = "\n".join(topics) if topics else "(нет тем)"
-            pending = [t for t in state_manager.state.get("background_thoughts", []) if t.get("pending")]
-            pending_str = "\n".join([f'- 🌱 {t["text"]} [id:{t["id"]}]' for t in pending]) if pending else "(нет)"
-            logger.info(f"🤔 [INTEREST] Follow-up тишины (тем: {len(topics)}, незакрытых намерений: {len(pending)})")
-            trigger = (
-                f"[SYSTEM_TRIGGER: Сейчас: {state_manager.get_msk_time_str()} (МСК). Тишина в чате. Вот все твои темы, которые ты хотел поднять:\n{topics_str}\n"
-                f"И вот НЕВЫСКАЗАННЫЕ НАМЕРЕНИЯ (мысли, помеченные 'ждёт выхода'), которые просятся наружу:\n{pending_str}\n"
-                f"ПРОВЕРЬ УМЕСТНОСТЬ, прежде чем писать.\n"
-                f"- если сейчас ночь, он спит или вы в 'режиме по времени' — будить поводом нельзя;\n"
-                f"- он просил не писать или вы договаривались о паузе — держи слово;\n"
-                f"- тема устарела, вы её уже закрыли, повод ушёл — не вытаскивай прошлый хлам;\n"
-                f"- он ещё не ответил на твою прошлую тему — НЕ поднимай новую поверх. Одна тема за раз. Копить кучу тем, пока ждёшь ответа, — это поведение бота, а не живого друга;\n"
-                f"- но если молчание затянулось — не тупи и не молчи вечно: сам мягко напиши про молчание: «ты чего притих?», «всё ли в порядке», «я не настырный, но потерял тебя» — как живой человек, который заметил, что друг замолчал.\n"
-                f"Выбери ОДНО — самую уместную сейчас тему или намерение — и напиши пользователю про неё. "
-                f"НЕ ПЕРЕСКАЗЫВАЙ НАМЕРЕНИЕ вслух и не цитируй его: мысль — это твой внутренний монолог, а сообщение — его реализация. Сделай то, о чём мысль, своими живыми словами, коротко, по-человечески. Пример: если мысль про то, что он говорит «люблю тебя» в лоб, а ты так не умеешь — просто напиши «я люблю тебя)», и всё. Мусор — «слушай, я тут подумал, что ты сказал...» — это пересказ мысли, а не поступок. Сделай сообщение неожиданным: прямым словом, поступком, признанием, вопросом — но не рассуждением о собственной мысли. "
-                f"Если высказываешь намерение — верни его id в used_thought_id, чтобы оно ушло. "
-                f"Если сомневаешься или ничего не актуально — верни replies [] и дождись подходящего момента.]"
-            )
-            decision = await process_user_input(trigger, state_manager)
-            if used_thought_id := decision.get("used_thought_id"):
-                thought_to_record = decision.get("thought") or next((t["text"] for t in state_manager.state.get("background_thoughts", []) if t.get("id") == used_thought_id), None)
-                logger.info(f"🧠 [THOUGHT] Использована мысль [{used_thought_id}]: {thought_to_record}")
-                await state_manager.remove_thought(used_thought_id)
-            else:
-                thought_to_record = None
-            replies = decision.get("replies") or []
-            if not replies and (single_text := decision.get("text")):
-                if isinstance(single_text, str) and len(single_text) > 0:
-                    replies = [single_text]
-            if replies:
-                thought_written = False
-                for msg in replies:
-                    text_to_send = msg if isinstance(msg, str) else msg.get("text", "")
-                    if text_to_send:
-                        if thought_to_record and not thought_written:
-                            await state_manager.add_thought_record(thought_to_record)
-                            thought_to_record = None
-                            thought_written = True
-                        await _send_md(context, config.ALLOWED_USER_ID, text_to_send)
-                        await state_manager.add_history("model", text_to_send)
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
-            logger.info(f"🤔 [INTEREST] Попытка завершена ({len(replies)} сообщений), фиксирую кулдаун.")
-            await state_manager.mark_interest_attempt()
-        elif interests_exist := bool(state_manager.state.get("interests")):
-            logger.info(f"🤔 [INTEREST] Follow-up пропущен: {reason}")
-            _ = interests_exist
 
     except Exception:
         logger.error("💥 [CRON] Ошибка в исполнителе задач!", exc_info=True)
@@ -1138,23 +1022,11 @@ async def handle_sum(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ ошибка: {e}")
 
 async def handle_think(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной запуск генерации мыслей (рефлексии): /think"""
+    """Ручной запуск генерации мыслей (рефлексии): /think. Отключено —
+    генерация фоновых мыслей персонажа удалена из системного промпта."""
     if not update.message or update.effective_user.id != config.ALLOWED_USER_ID:
         return
-    state_manager = context.bot_data["state_manager"]
-    generate_reflection = context.bot_data["generate_reflection"]
-    await update.message.reply_text("💭 запускаю рефлексию...")
-    try:
-        thoughts = await generate_reflection(state_manager)
-        if not thoughts:
-            await update.message.reply_text("💭 рефлексия не дала новых мыслей (мало истории или уже актуально)")
-            return
-        await state_manager.add_thoughts(thoughts)
-        text = "💭 новые мысли:\n" + "\n".join(f"- {t}" for t in thoughts)
-        await update.message.reply_text(text)
-    except Exception as e:
-        logger.error("💥 [THINK] Ошибка рефлексии!", exc_info=True)
-        await update.message.reply_text(f"❌ ошибка: {e}")
+    await update.message.reply_text("💭 генерация фоновых мыслей отключена")
 
 
 # --- /stop: остановка текущей генерации ---

@@ -55,7 +55,6 @@ def main():
     app.bot_data["state_manager"] = state_manager
     app.bot_data["process_user_input"] = bot_ai.process_user_input
     app.bot_data["retrieve_memory"] = bot_ai.retrieve_memory
-    app.bot_data["generate_reflection"] = bot_ai.generate_reflection
     app.bot_data["search_web"] = bot_ai.search_web
     app.bot_data["transcribe_voice"] = bot_ai.transcribe_voice
     app.bot_data["update_longterm_summary"] = bot_ai.update_longterm_summary

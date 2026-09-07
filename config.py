@@ -45,15 +45,10 @@ LLM_DEBUG_FILE = "last_gemini_prompt.txt"  # последний промпт, у
 
 # --- Временные интервалы ---
 CHECK_INTERVAL_SECONDS = 60
-REFLECTION_INTERVAL_HOURS = 1
-SILENCE_BEFORE_REFLECTION_HOURS = 0.15
-SILENCE_BEFORE_PROACTIVE_MINUTES = 30
-MAX_BACKGROUND_THOUGHTS = 3  # ротация фоновых мыслей: оставляем только последние N (в промт идёт N мыслей)
 
-# --- Будильники и темы ---
+# --- Будильники ---
 ALARM_MAX_MISSES = 2
 ALARM_CONTEXT_SNIPPET = 8
-INTEREST_FOLLOWUP_COOLDOWN_MINUTES = 30
 
 # --- Вывод инструментов в истории ---
 TOOL_RESULT_LIMIT = 500  # вывод ≤500 → целиком в историю; >500 → выжимка/факт
@@ -61,12 +56,9 @@ SUMMARY_INPUT_LIMIT = 1500  # в выжимку слать максимум ст
 MAX_TOOLS_TURN = 8  # максимум инструментов (команды/поиск/воспоминания) подряд на одно сообщение; дальше — принудительный текстовый ответ
 CHAT_HISTORY_LIMIT = 50  # лимит истории сообщений (для модели и триггера саммари)
 
-# --- Параметры "человечности" ---
+# --- Параметры ответа ---
 TYPO_CHANCE = 0.15
 FALLBACK_PHRASES = ["отвлекли щас", "телега подвисла кажется", "подожди", "щас", "сек"]
-
-# --- Параметры рефлексии ---
-REFLECTION_TEMPERATURE = float(os.getenv('REFLECTION_TEMPERATURE', '0.7'))
 
 # --- Проверка критических переменных ---
 if not TELEGRAM_TOKEN:
