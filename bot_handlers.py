@@ -100,8 +100,8 @@ def _md_to_mdv2(text):
     s = _re.sub(r'```[\w-]*\n?.*?```', _hold, s, flags=_re.S)
     # 2) инлайн-код `...`
     s = _re.sub(r'`[^`\n]+`', _hold, s)
-    # 3) ссылки [текст](url)
-    s = _re.sub(r'\[[^\[\]\n]+\]\([^()\n]+\)', _hold, s)
+    # 3) ссылки [текст](url) → URL (чистим markdown-обёртки, чтобы не ломали код/команды)
+    s = _re.sub(r'\[[^\[\]\n]+\]\([^()\n]+\)', lambda m: tools_registry._strip_md_links(m.group(0)), s)
     # 4) жирный курсив ***...*** → *_..._* (Telegram V2: жирный оборачивает курсив)
     s = _re.sub(r'\*{3}([^*]+)\*{3}', lambda m: tokens.append("*_" + m.group(1) + "_*") or f"\x00{len(tokens)-1}\x00", s)
     # 5) жирный **...** → *...* (Telegram V2: жирный = *)
@@ -398,7 +398,8 @@ async def _tool_loop(update, context, state_manager, user_text, initial_decision
             if len(out_block) <= config.TOOL_RESULT_LIMIT:
                 report = out_block
             else:
-                report = await summarize_tool_output(call_str, method_schema.get("description", ""), out_block, state_manager)
+                tool_purpose = kwargs.get("desc") or method_schema.get("description", "")
+                report = await summarize_tool_output(call_str, tool_purpose, out_block, state_manager)
             rec = f'🔧 вызвал: {call_str} → {report}'
             await state_manager.add_tool_record(rec)
 
@@ -1758,7 +1759,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"напиши в формате:\n"
                 f"`host:port:user:pass`\n\n"
                 f"пример:\n"
-                f"`170.83.236.245:8000:15Uo6V:3HF2Fh`",
+                f"`168.196.238.152:9260:pRDsPs:pbB3qX`",
                 parse_mode="Markdown",
             )
             context.user_data["editing_proxy"] = prov_name

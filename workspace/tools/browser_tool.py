@@ -14,25 +14,28 @@ DAEMON = "http://127.0.0.1:18933"
 
 TOOL = {
     "name": "browser",
-    "description": "Браузер — ТОЛЬКО для ДЕЙСТВИЙ: регистрация, отклик на вакансию, заявка, логин, клики, заполнение форм. НЕ для чтения текста, новостей, поиска информации или контента — для этого есть поисковой агент. Подписки/продления и иной текст тоже НЕ читать. Возвращает только заголовок страницы и кликабельные элементы.",
+    "description": "Браузер — ТОЛЬКО для ДЕЙСТВИЙ: регистрация, отклик на вакансию, заявка, логин, клики, заполнение форм. НЕ для чтения текста, новостей, поиска информации или контента — для этого есть поисковой агент. Подписки/продления и иной текст тоже НЕ читать. Возвращает только заголовок страницы и кликабельные элементы. Если ищешь конкретный элемент — передай desc ('кнопка Создать репозиторий', 'поле ввода email'), чтобы выжимка вернула именно его, а не весь список.",
     "methods": {
         "open": {
             "description": "Открыть URL (одна вкладка — прежняя закрывается). Если URL не указан — откроет последнюю посещённую страницу. Возвращает заголовок + кликабельные элементы (не контент).",
             "params": [
                 {"name": "url", "type": "str", "required": False, "description": "https:// ссылка. Пусто = вернуться на последний посещённый URL"},
                 {"name": "profile", "type": "str", "required": False, "default": "main", "description": "имя профиля с куками (сессии различных сайтов не смешивать)"},
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем: описание нужного элемента, чтобы выжимка вернула только его (например 'кнопка Создать')"},
             ],
         },
         "snapshot": {
             "description": "Обновить состояние страницы: заголовок + кликабельные элементы (ref). Зови если страница могла измениться без действий браузера. Без контента — текст только через dump() при реальной необходимости.",
             "params": [
                 {"name": "include_text", "type": "bool", "required": False, "default": False, "description": "включить текст страницы (ТОЛЬКО если это реально нужно для действия)"},
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем: описание нужного элемента, чтобы выжимка вернула только его (например 'кнопка Создать')"},
             ],
         },
         "click": {
             "description": "Кликнуть элемент по ref из последнего snapshot.",
             "params": [
                 {"name": "ref", "type": "str", "required": True, "description": "например e3"},
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем следующим (для выжимки)"},
             ],
         },
         "fill": {
@@ -40,15 +43,20 @@ TOOL = {
             "params": [
                 {"name": "ref", "type": "str", "required": True, "description": "ref поля"},
                 {"name": "value", "type": "str", "required": True, "description": "текст для ввода"},
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем следующим (для выжимки)"},
             ],
         },
         "submit": {
             "description": "Нажать Enter (отправить активную форму). После — новый snapshot.",
-            "params": [],
+            "params": [
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем следующим (для выжимки)"},
+            ],
         },
         "reload": {
             "description": "Обновить текущую страницу. После — новый snapshot.",
-            "params": [],
+            "params": [
+                {"name": "desc", "type": "str", "required": False, "description": "что ищем следующим (для выжимки)"},
+            ],
         },
         "dump": {
             "description": "Полный текст страницы. Вызывай ТОЛЬКО если для действия реально нужен контент (например, ищешь слово/кнопку, не попавшую в паспорт). Не вызывай из любопытства — браузер не для чтения.",
@@ -91,34 +99,35 @@ def _call(action, **kwargs):
     return data.get("result")
 
 
-def open(url, profile="main"):
+def open(url, profile="main", desc=""):
     """Открыть URL. Возвращает заголовки + кликабельные элементы."""
-    return _call("open", url=url, profile=profile)
+    return _call("open", url=url, profile=profile, desc=desc)
 
 
-def snapshot(include_text=False):
-    """Обновить состояние страницы: заголовки + элементы (а не текст)."""
-    return _call("snapshot", include_text=bool(include_text))
+def snapshot(include_text=False, desc=""):
+    """Обновить состояние страницы: заголовки + элементы (а не текст).
+    desc — что ищем (для выжимки)."""
+    return _call("snapshot", include_text=bool(include_text), desc=desc)
 
 
-def click(ref):
+def click(ref, desc=""):
     """Клик по ref. Возвращает новый snapshot."""
-    return _call("click", ref=ref)
+    return _call("click", ref=ref, desc=desc)
 
 
-def fill(ref, value):
+def fill(ref, value, desc=""):
     """Заполнить поле по ref. Возвращает новый snapshot."""
-    return _call("fill", ref=ref, value=value)
+    return _call("fill", ref=ref, value=value, desc=desc)
 
 
-def submit():
+def submit(desc=""):
     """Enter. Возвращает новый snapshot."""
-    return _call("submit")
+    return _call("submit", desc=desc)
 
 
-def reload():
+def reload(desc=""):
     """Обновить страницу. Возвращает новый snapshot."""
-    return _call("reload")
+    return _call("reload", desc=desc)
 
 
 def dump(limit=3000):

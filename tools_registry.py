@@ -390,11 +390,21 @@ def _unescape_literals(s: str) -> str:
     return "".join(out)
 
 
+def _strip_md_links(s: str) -> str:
+    """Убирает markdown-обёртки ссылок [text](url) -> url во всех значениях,
+    которые уходят в команды/файлы/код. Модель (Gemini) часто оборачивает URL
+    в markdown-ссылки, что ломает браузер, shell и запись в файлы."""
+    if "[" not in s:
+        return s
+    import re as _re
+    return _re.sub(r'\[[^\[\]\n]+\]\(([^()\n]+)\)', r'\1', s)
+
+
 def _parse_value(v: str):
     if not v:
         return ""
     if (v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'"):
-        return _unescape_literals(v[1:-1])
+        return _strip_md_links(_unescape_literals(v[1:-1]))
     if v.lower() in ("true", "false", "null", "none"):
         return {"true": True, "false": False, "null": None, "none": None}[v.lower()]
     try:
@@ -405,7 +415,7 @@ def _parse_value(v: str):
         return float(v)
     except ValueError:
         pass
-    return v
+    return _strip_md_links(v)
 
 
 def build_cli_args(method_schema: dict, kwargs: dict) -> list:

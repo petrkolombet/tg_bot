@@ -247,7 +247,12 @@ def _sandbox_prefix(entry: str, *extra) -> list:
     """Общий bwrap-префикс. entry — исполняемая программа внутри sandbox
     ('bash' — интерактивная команда через -c, 'python3' — тул-скрипт).
     extra — доп. аргументы после entry (например '-c')."""
-    return [
+    # Монтируем родителя WORKSPACE (например /root или /home/petr/tg_bot) как ro,
+    # чтобы песочница видела скрипты проекта (_tool_runner.py и т.д.) независимо
+    # от того, где лежит проект (старый сервер /root, ноут /home/petr/tg_bot).
+    workspace_real = WORKSPACE.resolve()
+    project_root = workspace_real.parent if workspace_real.name == "workspace" else workspace_real
+    prefix = [
         "bwrap", "--unshare-ipc",
         "--ro-bind", "/usr", "/usr",
         "--ro-bind", "/lib", "/lib",
@@ -257,7 +262,6 @@ def _sandbox_prefix(entry: str, *extra) -> list:
         "--ro-bind", "/etc", "/etc",
         "--ro-bind", "/run", "/run",
         "--ro-bind", "/var", "/var",
-        "--ro-bind", "/root", "/root",
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
@@ -265,9 +269,25 @@ def _sandbox_prefix(entry: str, *extra) -> list:
         "--setenv", "HOME", str(WORKSPACE),
         "--chdir", str(WORKSPACE),
         "--dir", str(WORKSPACE),
-        "--bind", str(WORKSPACE), str(WORKSPACE),
-        entry, *extra,
     ]
+    if str(project_root) != "/":
+        prefix.append("--ro-bind")
+        prefix.append(str(project_root))
+        prefix.append(str(project_root))
+    # Монтируем user site-packages (~/.local/lib/pythonX.Y/site-packages) как ro,
+    # чтобы внутри песочницы импортировались пакеты пользователя (dotenv,
+    # playwright и т.д.), независимо от того, где HOME рабочего процесса.
+    import site as _site, os as _os
+    user_site = _site.getusersitepackages()
+    if _os.path.isdir(user_site):
+        prefix.append("--ro-bind")
+        prefix.append(user_site)
+        prefix.append(user_site)
+        prefix.append("--setenv")
+        prefix.append("PYTHONPATH")
+        prefix.append(user_site)
+    prefix += ["--bind", str(WORKSPACE), str(WORKSPACE), entry, *extra]
+    return prefix
 
 
 async def execute_custom_tool(script_path: str, method: str, kwargs: dict = None, timeout: int = 60) -> dict:

@@ -389,7 +389,7 @@ class BrowserManager:
                 continue
         return refs
 
-    def _snapshot_refs(self, max_refs=30, skip_names=None):
+    def _snapshot_refs(self, max_refs=45, skip_names=None):
         """Список кликабельных элементов. Если пусто — JS не догрузился,
         ждём секунду (страницы вроде Bing дорисовывают контент после load)."""
         self.refs = {}
@@ -437,7 +437,7 @@ class BrowserManager:
 
     # ---------- операции ----------
 
-    def open(self, url="", profile="main"):
+    def open(self, url="", profile="main", desc=""):
         if not url or not url.strip():
             url = self.last_url
         if not url or not url.startswith(("http://", "https://")):
@@ -458,11 +458,12 @@ class BrowserManager:
         self._save_last_url()
         self.save_state()
         self._touch()
-        return self.snapshot(include_text=False)
+        return self.snapshot(include_text=False, desc=desc)
 
-    def snapshot(self, include_text=False, text_limit=1200):
+    def snapshot(self, include_text=False, text_limit=1200, desc=""):
         """Паспорт страницы: заголовки (о чём) + кликабельные элементы (что можно сделать).
-        Текст страницы — только при include_text=True (или через dump)."""
+        Текст страницы — только при include_text=True (или через dump).
+        desc — что ищем (вспомогательное; фильтрацию сделает выжимка на стороне бота)."""
         self.ensure_started()
         self._prune_extra_pages()
         headings = self._page_headings()
@@ -479,7 +480,7 @@ class BrowserManager:
         self._touch()
         return out
 
-    def click(self, ref):
+    def click(self, ref, desc=""):
         self.ensure_started()
         self._prune_extra_pages()
         loc = self.refs.get(ref)
@@ -493,9 +494,9 @@ class BrowserManager:
         loc.click(timeout=ACTION_TIMEOUT)
         self.save_state()
         self._touch()
-        return self.snapshot(include_text=False)
+        return self.snapshot(include_text=False, desc=desc)
 
-    def fill(self, ref, value):
+    def fill(self, ref, value, desc=""):
         self.ensure_started()
         self._prune_extra_pages()
         loc = self.refs.get(ref)
@@ -508,18 +509,18 @@ class BrowserManager:
             self.page.keyboard.type(value, delay=10)
         self.save_state()
         self._touch()
-        return self.snapshot(include_text=False)
+        return self.snapshot(include_text=False, desc=desc)
 
-    def submit(self):
+    def submit(self, desc=""):
         self.ensure_started()
         self._prune_extra_pages()
         self.page.keyboard.press("Enter")
         self.page.wait_for_timeout(1500)
         self.save_state()
         self._touch()
-        return self.snapshot(include_text=False)
+        return self.snapshot(include_text=False, desc=desc)
 
-    def reload(self):
+    def reload(self, desc=""):
         self.ensure_started()
         self._prune_extra_pages()
         try:
