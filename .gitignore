@@ -14,7 +14,5 @@ state.json
 venv/
 workspace/*
 !workspace/tools/
-workspace/tools/*
-!workspace/tools/browser_tool.py
 
 rag_storage/
